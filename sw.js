@@ -1,4 +1,4 @@
-const CACHE = "aluvi-v23";
+const CACHE = "aluvi-v30";
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["./", "./index.html"])).then(() => self.skipWaiting()));
 });

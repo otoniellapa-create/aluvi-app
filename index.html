@@ -856,6 +856,7 @@ const SEED = () => ({
   certificacoes: CHECKLIST_CERT(),
   usuarios: [],
   patrocinios: [],
+  deletados: [],
   config: {
     nomeFazenda: "Águas Douradas",
     responsaveis: ["Oto", "João"],
@@ -871,6 +872,24 @@ const SEED = () => ({
     }
   }
 });
+
+/* estoque derivado dos movimentos (fonte da verdade = movsEstoque) */
+function recalcEstoque(d) {
+  const saldo = {};
+  (d.movsEstoque || []).forEach(m => {
+    if (!m.itemId) return;
+    saldo[m.itemId] = (saldo[m.itemId] || 0) + (m.tipo === "entrada" ? m.qtd || 0 : -(m.qtd || 0));
+  });
+  (d.estoque || []).forEach(it => {
+    it.qtd = Math.max(0, Math.round((saldo[it.id] || 0) * 1000) / 1000);
+  });
+}
+/* exclusão com lápide (para sincronização): registra o id e filtra */
+function delReg(d, colecao, id) {
+  if (!d.deletados) d.deletados = [];
+  if (!d.deletados.includes(id)) d.deletados.push(id);
+  d[colecao] = (d[colecao] || []).filter(x => x.id !== id);
+}
 
 /* migração leve: garante chaves novas em stores antigos */
 function migrar(d) {
@@ -902,6 +921,27 @@ function migrar(d) {
   }));
   /* quem já tem lançamentos não passa pelo wizard de novo */
   if (d.config.onboarded === undefined) d.config.onboarded = (d.lotes?.length || 0) + (d.parametros?.length || 0) + (d.arracoamentos?.length || 0) + (d.movsEstoque?.length || 0) > 0;
+  if (!d.deletados) d.deletados = [];
+  /* estoque passa a ser derivado dos movimentos: gera mov de saldo p/ diferenças legadas */
+  (d.estoque || []).forEach(it => {
+    const derivado = (d.movsEstoque || []).reduce((t, m) => m.itemId === it.id ? t + (m.tipo === "entrada" ? m.qtd || 0 : -(m.qtd || 0)) : t, 0);
+    const dif = Math.round(((it.qtd || 0) - derivado) * 1000) / 1000;
+    const refId = "saldo-migracao-" + it.id;
+    if (Math.abs(dif) > 0.0005 && !(d.movsEstoque || []).some(m => m.refId === refId)) {
+      d.movsEstoque.push({
+        id: uid(),
+        um: Date.now(),
+        refId,
+        itemId: it.id,
+        dataISO: hojeISO(),
+        ts: Date.now(),
+        tipo: dif > 0 ? "entrada" : "saida",
+        qtd: Math.abs(dif),
+        origem: "Saldo inicial (migração)"
+      });
+    }
+  });
+  recalcEstoque(d);
   return d;
 }
 
@@ -2230,6 +2270,252 @@ const Stat = ({
     color: C.muted
   }
 }, sub));
+/* ================= ALUVI Cloud — sincronização multiusuário (Supabase) =================
+   Modelo: 1 documento JSON por fazenda, revisões otimistas, merge por id.
+   - Coleções (arrays de objetos com id): união por id; em conflito vence o maior `um` (edição) ou `ts`.
+   - Exclusões: lápides em `deletados` (união) — excluído em um aparelho, some em todos.
+   - config: vence o de maior `um`.
+   - Estoque: derivado dos movimentos (append-only) → merge sem perda.
+   - Segurança desta fase: o id da fazenda é um TOKEN SECRETO derivado de nome+senha (SHA-256).
+     Quem não tem a senha não adivinha o id. Login individual real (e-mail/senha) vem na próxima fase. */
+
+const SUPA_URL = "https://ztfpeabfhuwdtdpvftft.supabase.co";
+const SUPA_KEY = "sb_publishable_skyJRqJCQverL_eDYGUZvg_0KvPp4hC";
+const SUPA_TB = "aluvi_estado";
+async function sha256hex(txt) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(txt));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+const chaveFazenda = async (rotulo, senha) => "fz_" + (await sha256hex(`aluvi|${(rotulo || "").trim().toLowerCase()}|${senha || ""}`)).slice(0, 40);
+const supaHeaders = extra => ({
+  apikey: SUPA_KEY,
+  Authorization: `Bearer ${SUPA_KEY}`,
+  "Content-Type": "application/json",
+  ...extra
+});
+async function nuvemGet(fazendaId, soRev) {
+  const sel = soRev ? "rev" : "rev,dados";
+  const r = await fetch(`${SUPA_URL}/rest/v1/${SUPA_TB}?fazenda_id=eq.${encodeURIComponent(fazendaId)}&select=${sel}`, {
+    headers: supaHeaders()
+  });
+  if (!r.ok) throw new Error("nuvem GET " + r.status);
+  const arr = await r.json();
+  return arr[0] || null;
+}
+async function nuvemInsert(fazendaId, dados) {
+  const r = await fetch(`${SUPA_URL}/rest/v1/${SUPA_TB}`, {
+    method: "POST",
+    headers: supaHeaders({
+      Prefer: "return=minimal"
+    }),
+    body: JSON.stringify({
+      fazenda_id: fazendaId,
+      dados,
+      rev: 1
+    })
+  });
+  if (r.status === 409) return false; /* alguém criou antes — refaz o ciclo */
+  if (!r.ok) throw new Error("nuvem INSERT " + r.status);
+  return true;
+}
+async function nuvemUpdate(fazendaId, dados, revBase) {
+  const r = await fetch(`${SUPA_URL}/rest/v1/${SUPA_TB}?fazenda_id=eq.${encodeURIComponent(fazendaId)}&rev=eq.${revBase}`, {
+    method: "PATCH",
+    headers: supaHeaders({
+      Prefer: "return=representation"
+    }),
+    body: JSON.stringify({
+      dados,
+      rev: revBase + 1,
+      updated_at: new Date().toISOString()
+    })
+  });
+  if (!r.ok) throw new Error("nuvem PATCH " + r.status);
+  const arr = await r.json();
+  return arr.length > 0; /* false = outra pessoa gravou antes (rev mudou) → merge de novo */
+}
+
+/* merge de dois stores completos */
+function mesclarStores(local, remoto) {
+  const out = structuredClone(local);
+  const dels = new Set([...(local.deletados || []), ...(remoto.deletados || [])]);
+  out.deletados = [...dels];
+  const chaves = new Set([...Object.keys(local), ...Object.keys(remoto)]);
+  chaves.forEach(k => {
+    if (k === "deletados" || k === "config") return;
+    const a = local[k],
+      b = remoto[k];
+    if (!Array.isArray(a) && !Array.isArray(b)) return;
+    const la = Array.isArray(a) ? a : [],
+      lb = Array.isArray(b) ? b : [];
+    /* só mescla arrays de objetos com id */
+    const temId = [...la, ...lb].some(x => x && typeof x === "object" && x.id !== undefined);
+    if (!temId) {
+      out[k] = la.length ? la : lb;
+      return;
+    }
+    const porId = new Map();
+    la.forEach(x => {
+      if (x && x.id !== undefined) porId.set(x.id, x);
+    });
+    lb.forEach(x => {
+      if (!x || x.id === undefined) return;
+      const cur = porId.get(x.id);
+      if (!cur) {
+        porId.set(x.id, x);
+        return;
+      }
+      const ta = cur.um || cur.ts || 0,
+        tb = x.um || x.ts || 0;
+      if (tb > ta) porId.set(x.id, x);
+    });
+    out[k] = [...porId.values()].filter(x => !dels.has(x.id));
+  });
+  if (remoto.config && (remoto.config.um || 0) > (local.config?.um || 0)) out.config = remoto.config;
+  /* nunca herdar o desligamento/estado de nuvem do outro aparelho */
+  if (out.config && local.config) out.config.nuvem = local.config.nuvem;
+  recalcEstoque(out);
+  return out;
+}
+
+/* ---------- UI: cartão da nuvem em Config ---------- */
+const NuvemCard = () => {
+  const {
+    s,
+    up,
+    sync,
+    resetAll
+  } = useApp();
+  const [modal, setModal] = useState(null); /* 'ativar' */
+  const nv = s.config.nuvem;
+  return /*#__PURE__*/React.createElement(Card, {
+    style: {
+      borderColor: nv?.ativa ? C.ok + "44" : C.ouro + "44"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 6
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: C.ouroClaro,
+      letterSpacing: 0.4
+    }
+  }, "☁️ NUVEM ALUVI — SINCRONIZAÇÃO DA EQUIPE"), nv?.ativa ? /*#__PURE__*/React.createElement(Chip, {
+    nivel: sync.status === "erro" || sync.status === "offline" ? "warn" : "ok"
+  }, sync.status === "sincronizando" ? "sincronizando…" : sync.status === "offline" ? "offline" : sync.status === "erro" ? "erro" : "conectada") : /*#__PURE__*/React.createElement(Chip, {
+    nivel: "warn"
+  }, "desligada")), nv?.ativa ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(KV, {
+    linhas: [["Fazenda na nuvem", nv.rotulo], ["Última sincronização", sync.ultima ? new Date(sync.ultima).toLocaleTimeString("pt-BR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    }) : "—"]]
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.ink2,
+      lineHeight: 1.5,
+      margin: "6px 0 10px"
+    }
+  }, "Tudo que a equipe lança — em Salvador, Conquista ou Livramento — se junta aqui automaticamente. Sem internet, o app segue funcionando e sincroniza quando a rede volta."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    tipo: "fantasma",
+    onClick: () => sync.agora()
+  }, "Sincronizar agora"), /*#__PURE__*/React.createElement(Btn, {
+    tipo: "perigo",
+    onClick: () => up(d => {
+      d.config.nuvem = {
+        ativa: false
+      };
+    })
+  }, "Desligar neste aparelho"))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.ink2,
+      lineHeight: 1.5,
+      marginBottom: 10
+    }
+  }, "Ligue pra equipe inteira trabalhar junta: cada lançamento sobe pra nuvem e aparece nos aparelhos de todos em segundos. Defina um ", /*#__PURE__*/React.createElement("b", null, "nome de fazenda"), " e uma ", /*#__PURE__*/React.createElement("b", null, "senha da equipe"), " — os outros aparelhos entram com os mesmos dados."), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => setModal("ativar")
+  }, "Ligar sincronização")), modal === "ativar" && /*#__PURE__*/React.createElement(FormModal, {
+    titulo: "Ligar a Nuvem ALUVI",
+    onFechar: () => setModal(null),
+    campos: [{
+      k: "rotulo",
+      label: "Nome da fazenda na nuvem",
+      req: true,
+      largo: true,
+      ph: "ex.: aguas-douradas",
+      dica: "Igual em todos os aparelhos da equipe"
+    }, {
+      k: "senha",
+      label: "Senha da equipe",
+      req: true,
+      largo: true,
+      ph: "combine com o time",
+      dica: "Quem tem nome + senha acessa os dados da fazenda"
+    }],
+    extra: /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: C.muted,
+        margin: "0 0 8px",
+        lineHeight: 1.5
+      }
+    }, "Se a fazenda já existir na nuvem, os dados de lá se juntam aos deste aparelho. Proteção desta fase: segredo compartilhado; login individual com e-mail vem na próxima etapa."),
+    onSalvar: async v => {
+      const id = await chaveFazenda(v.rotulo, v.senha);
+      up(d => {
+        d.config.nuvem = {
+          ativa: true,
+          id,
+          rotulo: v.rotulo.trim()
+        };
+      });
+      setModal(null);
+      setTimeout(() => sync.agora(), 300);
+    }
+  }));
+};
+
+/* ---------- indicador compacto (sidebar/header) ---------- */
+const SyncDot = ({
+  sync,
+  nuvemAtiva
+}) => {
+  if (!nuvemAtiva) return null;
+  const cor = sync.status === "ok" ? C.ok : sync.status === "sincronizando" ? C.ouroClaro : C.warn;
+  const rotulo = sync.status === "ok" ? "nuvem ok" : sync.status === "sincronizando" ? "sincronizando" : sync.status === "offline" ? "offline" : "erro de nuvem";
+  return /*#__PURE__*/React.createElement("span", {
+    title: rotulo,
+    style: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 5,
+      fontSize: 9.5,
+      color: C.muted
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 8,
+      height: 8,
+      borderRadius: "50%",
+      background: cor,
+      display: "inline-block",
+      boxShadow: sync.status === "ok" ? `0 0 6px ${C.ok}88` : "none"
+    }
+  }), rotulo);
+};
 /* ================= Home (gestor) + Tanques & Lotes ================= */
 
 const DIAS_SEM = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
@@ -2756,6 +3042,7 @@ const TanquesScreen = ({
         const loteId = uid();
         d.lotes.push({
           id: loteId,
+          um: Date.now(),
           tanqueId: sel,
           status: "ativo",
           ...loteDados
@@ -2763,6 +3050,7 @@ const TanquesScreen = ({
         const dp = loteDados.dataPovoamento;
         if (mortosAcum > 0) d.mortalidades.push({
           id: uid(),
+          um: Date.now(),
           loteId,
           dataISO: dp,
           ts: Date.now(),
@@ -2772,6 +3060,7 @@ const TanquesScreen = ({
         });
         if (pesoAtualG > 0) d.biometrias.push({
           id: uid(),
+          um: Date.now(),
           loteId,
           dataISO: hojeISO(),
           ts: Date.now(),
@@ -2840,7 +3129,9 @@ const TanquesScreen = ({
     onSalvar: v => {
       up(d => {
         const l = d.lotes.find(x => x.id === lote.id);
-        Object.assign(l, v);
+        Object.assign(l, v, {
+          um: Date.now()
+        });
       });
       setModal(null);
     }
@@ -2910,7 +3201,7 @@ const TanquesScreen = ({
     }],
     onExcluir: !s.lotes.some(l => l.tanqueId === sel) ? () => {
       up(d => {
-        d.tanques = d.tanques.filter(t => t.id !== sel);
+        delReg(d, "tanques", sel);
       });
       setSel(s.tanques.find(t => t.id !== sel)?.id || null);
     } : undefined,
@@ -2922,7 +3213,8 @@ const TanquesScreen = ({
       up(d => {
         const t = d.tanques.find(x => x.id === sel);
         Object.assign(t, resto, {
-          ativo: ativoSel === "Sim"
+          ativo: ativoSel === "Sim",
+          um: Date.now()
         });
       });
       setModal(null);
@@ -2960,15 +3252,18 @@ const TanquesScreen = ({
     }],
     valida: (v, st) => st.tanques.some(t => t.id.toLowerCase() === String(v.id).toLowerCase()) ? "Já existe tanque com esse código." : null,
     onSalvar: v => {
+      const novoId = String(v.id).toUpperCase();
       up(d => {
+        d.deletados = d.deletados.filter(x => x !== novoId);
         d.tanques.push({
           ...v,
-          id: String(v.id).toUpperCase(),
+          id: novoId,
+          um: Date.now(),
           ativo: true
         });
       });
       setModal(null);
-      setSel(String(v.id).toUpperCase());
+      setSel(novoId);
     }
   }));
 };
@@ -3074,7 +3369,7 @@ const ParamsScreen = ({
     nivel: "crit"
   }, ultAlertas.length, " fora"), /*#__PURE__*/React.createElement(BtnDel, {
     onDel: () => up(d => {
-      d.parametros = d.parametros.filter(x => x.id !== ult.id);
+      delReg(d, "parametros", ult.id);
     })
   }))), (() => {
     const t = [ult.tempSup, ult.tempMeio, ult.tempFundo].filter(v => v != null);
@@ -3148,7 +3443,7 @@ const ParamsScreen = ({
       nivel: "crit"
     }, al.length, " fora"), /*#__PURE__*/React.createElement(BtnDel, {
       onDel: () => up(d => {
-        d.parametros = d.parametros.filter(x => x.id !== p.id);
+        delReg(d, "parametros", p.id);
       })
     }))), /*#__PURE__*/React.createElement("div", {
       style: {
@@ -3257,6 +3552,7 @@ const ParamsScreen = ({
           const titulo = `Agir em ${sel}: ${dv.label} fora da faixa`;
           if (!d.lembretes.some(l => !l.done && l.titulo === titulo)) d.lembretes.push({
             id: uid(),
+            um: Date.now(),
             dataISO: v.dataISO || hojeISO(),
             titulo,
             origem: "Assistente — parâmetros",
@@ -3343,7 +3639,7 @@ const FeedScreen = ({
       if (it && d.movsEstoque.some(m => m.refId === a.id)) it.qtd += a.kg || 0;
       d.movsEstoque = d.movsEstoque.filter(m => m.refId !== a.id);
       d.custos = d.custos.filter(c => c.refId !== a.id);
-      d.arracoamentos = d.arracoamentos.filter(x => x.id !== a.id);
+      delReg(d, "arracoamentos", a.id);
     })
   }))), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -3396,6 +3692,7 @@ const FeedScreen = ({
         const aId = uid();
         d.arracoamentos.push({
           id: aId,
+          um: Date.now(),
           loteId: lote.id,
           ts: Date.now(),
           ...v,
@@ -3405,6 +3702,7 @@ const FeedScreen = ({
           item.qtd = Math.max(0, item.qtd - v.kg);
           d.movsEstoque.push({
             id: uid(),
+            um: Date.now(),
             refId: aId,
             itemId: item.id,
             dataISO: v.dataISO,
@@ -3415,6 +3713,7 @@ const FeedScreen = ({
           });
           if (item.precoUnit) d.custos.push({
             id: uid(),
+            um: Date.now(),
             refId: aId,
             loteId: lote.id,
             dataISO: v.dataISO,
@@ -3545,7 +3844,7 @@ const BioScreen = ({
     }
   }, b.nAmostras || "—", " amostras"), /*#__PURE__*/React.createElement(BtnDel, {
     onDel: () => up(d => {
-      d.biometrias = d.biometrias.filter(x => x.id !== b.id);
+      delReg(d, "biometrias", b.id);
     })
   }))), (b.pesoMinG || b.pesoMaxG) && /*#__PURE__*/React.createElement("div", {
     style: {
@@ -3592,6 +3891,7 @@ const BioScreen = ({
       up(d => {
         d.biometrias.push({
           id: uid(),
+          um: Date.now(),
           loteId: lote.id,
           ts: Date.now(),
           ...v
@@ -3665,7 +3965,7 @@ const CorrScreen = ({
       const it = d.estoque.find(i => i.id === c.produtoItemId);
       if (it && d.movsEstoque.some(m => m.refId === c.id)) it.qtd += c.totalAplicado || 0;
       d.movsEstoque = d.movsEstoque.filter(m => m.refId !== c.id);
-      d.correcoes = d.correcoes.filter(x => x.id !== c.id);
+      delReg(d, "correcoes", c.id);
     })
   }))), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -3732,6 +4032,7 @@ const CorrScreen = ({
         const cId = uid();
         d.correcoes.push({
           id: cId,
+          um: Date.now(),
           tanqueId: sel,
           ts: Date.now(),
           ...v,
@@ -3743,6 +4044,7 @@ const CorrScreen = ({
           item.qtd = Math.max(0, item.qtd - total);
           d.movsEstoque.push({
             id: uid(),
+            um: Date.now(),
             refId: cId,
             itemId: item.id,
             dataISO: v.dataISO,
@@ -3756,6 +4058,7 @@ const CorrScreen = ({
         const lemISO = `${lemData.getFullYear()}-${String(lemData.getMonth() + 1).padStart(2, "0")}-${String(lemData.getDate()).padStart(2, "0")}`;
         d.lembretes.push({
           id: uid(),
+          um: Date.now(),
           dataISO: lemISO,
           titulo: `Re-medir água de ${sel} (48h após ${v.tipo})`,
           origem: "Correção",
@@ -3839,7 +4142,7 @@ const MortScreen = ({
     }
   }, fmtData(m.dataISO)), /*#__PURE__*/React.createElement(BtnDel, {
     onDel: () => up(d => {
-      d.mortalidades = d.mortalidades.filter(x => x.id !== m.id);
+      delReg(d, "mortalidades", m.id);
     })
   }))), (m.acao || m.resp) && /*#__PURE__*/React.createElement("div", {
     style: {
@@ -3891,6 +4194,7 @@ const MortScreen = ({
       up(d => {
         d.mortalidades.push({
           id: uid(),
+          um: Date.now(),
           loteId: lote.id,
           ts: Date.now(),
           ...v
@@ -4086,6 +4390,7 @@ const StockScreen = ({
         if (v.precoUnit) it.precoUnit = v.precoUnit;
         d.movsEstoque.push({
           id: uid(),
+          um: Date.now(),
           itemId: it.id,
           dataISO: v.dataISO,
           ts: Date.now(),
@@ -4102,6 +4407,7 @@ const StockScreen = ({
           };
           d.custos.push({
             id: uid(),
+            um: Date.now(),
             loteId: null,
             dataISO: v.dataISO,
             ts: Date.now(),
@@ -4167,6 +4473,7 @@ const StockScreen = ({
       up(d => {
         d.estoque.push({
           id: uid(),
+          um: Date.now(),
           ...v,
           qtd: v.qtd || 0
         });
@@ -4216,6 +4523,7 @@ const StockScreen = ({
         if (!it) return;
         if (v.qtd !== it.qtd) d.movsEstoque.push({
           id: uid(),
+          um: Date.now(),
           itemId: it.id,
           dataISO: hojeISO(),
           ts: Date.now(),
@@ -4223,7 +4531,9 @@ const StockScreen = ({
           qtd: Math.abs(v.qtd - it.qtd),
           origem: "Ajuste de inventário"
         });
-        Object.assign(it, v);
+        Object.assign(it, v, {
+          um: Date.now()
+        });
       });
       setModal(null);
     }
@@ -4259,8 +4569,9 @@ const ManejoScreen = ({
   const toggle = t => {
     const feita = feitaDoTpl(t.id);
     up(d => {
-      if (feita) d.tarefasDone = d.tarefasDone.filter(x => x.id !== feita.id);else d.tarefasDone.push({
+      if (feita) delReg(d, "tarefasDone", feita.id);else d.tarefasDone.push({
         id: uid(),
+        um: Date.now(),
         templateId: t.id,
         dataISO: hojeISO(),
         titulo: t.titulo,
@@ -4334,7 +4645,10 @@ const ManejoScreen = ({
     tipo: "escuro",
     onClick: () => up(d => {
       const x = d.lembretes.find(y => y.id === l.id);
-      if (x) x.done = true;
+      if (x) {
+        x.done = true;
+        x.um = Date.now();
+      }
     })
   }, "feito")))), doDia.map(t => {
     const feita = feitaDoTpl(t.id);
@@ -4435,6 +4749,7 @@ const ManejoScreen = ({
       up(d => {
         d.tarefasDone.push({
           id: uid(),
+          um: Date.now(),
           templateId: null,
           dataISO: hojeISO(),
           categoria: "Avulsa",
@@ -4534,7 +4849,7 @@ const RotinaModal = ({
     }
   }, (t.dias || []).length === 7 ? "todos os dias" : (t.dias || []).map(d => DIAS_SEM[d]).join(", "))), /*#__PURE__*/React.createElement("button", {
     onClick: () => up(d => {
-      d.tarefasTemplate = d.tarefasTemplate.filter(x => x.id !== t.id);
+      delReg(d, "tarefasTemplate", t.id);
     }),
     style: {
       background: "none",
@@ -4651,6 +4966,7 @@ const NovaRotina = ({
       up(d => {
         d.tarefasTemplate.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });
       });
@@ -4830,6 +5146,7 @@ const DespScreen = ({
       up(d => {
         d.despescas.push({
           id: uid(),
+          um: Date.now(),
           loteId: lote.id,
           ts: Date.now(),
           ...v
@@ -4959,7 +5276,7 @@ const FinScreen = ({
       }
     }, fmtData(c.dataISO), l ? ` · ${l.tanqueId}` : ""), /*#__PURE__*/React.createElement(BtnDel, {
       onDel: () => up(d => {
-        d.custos = d.custos.filter(x => x.id !== c.id);
+        delReg(d, "custos", c.id);
       })
     }))), c.descricao && /*#__PURE__*/React.createElement("div", {
       style: {
@@ -5005,6 +5322,7 @@ const FinScreen = ({
       up(d => {
         d.custos.push({
           id: uid(),
+          um: Date.now(),
           ts: Date.now(),
           ...v,
           loteId: v.loteId || null
@@ -5216,17 +5534,20 @@ const EquipScreen = ({
       largo: true
     }],
     onExcluir: modal.tipo === "editarEq" ? () => up(d => {
-      d.equipamentos = d.equipamentos.filter(x => x.id !== modal.eq.id);
+      delReg(d, "equipamentos", modal.eq.id);
     }) : undefined,
     onSalvar: v => {
       up(d => {
         if (modal.tipo === "novo") d.equipamentos.push({
           id: uid(),
+          um: Date.now(),
           ...v,
           ultimaManutH: v.horimetro || 0
         });else {
           const e = d.equipamentos.find(x => x.id === modal.eq.id);
-          Object.assign(e, v);
+          Object.assign(e, v, {
+            um: Date.now()
+          });
         }
       });
       setModal(null);
@@ -5260,6 +5581,7 @@ const EquipScreen = ({
           ...d.config.energia,
           ...v
         };
+        d.config.um = Date.now();
       });
       setModal(null);
     }
@@ -5298,6 +5620,7 @@ const EquipScreen = ({
         if (ativos.length === 0) {
           d.custos.push({
             id: uid(),
+            um: Date.now(),
             loteId: null,
             dataISO: v.dataISO,
             ts: Date.now(),
@@ -5312,6 +5635,7 @@ const EquipScreen = ({
             const fatia = soma > 0 ? v.valor * pesos[i] / soma : v.valor / ativos.length;
             if (fatia > 0.005) d.custos.push({
               id: uid(),
+              um: Date.now(),
               loteId: l.id,
               dataISO: v.dataISO,
               ts: Date.now(),
@@ -5341,7 +5665,10 @@ const EquipScreen = ({
     onSalvar: v => {
       up(d => {
         const e = d.equipamentos.find(x => x.id === modal.eq.id);
-        if (e) e.horimetro = v.horimetro;
+        if (e) {
+          e.horimetro = v.horimetro;
+          e.um = Date.now();
+        }
       });
       setModal(null);
     }
@@ -5368,9 +5695,13 @@ const EquipScreen = ({
     onSalvar: v => {
       up(d => {
         const e = d.equipamentos.find(x => x.id === modal.eq.id);
-        if (e) e.ultimaManutH = e.horimetro || 0;
+        if (e) {
+          e.ultimaManutH = e.horimetro || 0;
+          e.um = Date.now();
+        }
         if (v.custo) d.custos.push({
           id: uid(),
+          um: Date.now(),
           loteId: null,
           dataISO: v.dataISO,
           ts: Date.now(),
@@ -5479,8 +5810,9 @@ const ConsultScreen = ({
       }
     }, "+ orientação"), /*#__PURE__*/React.createElement(BtnDel, {
       onDel: () => up(d => {
+        d.orientacoes.filter(o => o.consultorId === c.id).forEach(o => d.deletados.push(o.id));
         d.orientacoes = d.orientacoes.filter(o => o.consultorId !== c.id);
-        d.consultores = d.consultores.filter(x => x.id !== c.id);
+        delReg(d, "consultores", c.id);
       })
     }))), ors.slice(0, 3).map(o => {
       return /*#__PURE__*/React.createElement("div", {
@@ -5502,7 +5834,7 @@ const ConsultScreen = ({
         }
       }, /*#__PURE__*/React.createElement("span", null, fmtData(o.dataISO), o.tanqueId ? ` · tanque ${o.tanqueId}` : ""), /*#__PURE__*/React.createElement(BtnDel, {
         onDel: () => up(d => {
-          d.orientacoes = d.orientacoes.filter(x => x.id !== o.id);
+          delReg(d, "orientacoes", o.id);
         })
       })), /*#__PURE__*/React.createElement("div", {
         style: {
@@ -5545,6 +5877,7 @@ const ConsultScreen = ({
       up(d => {
         d.consultores.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });
       });
@@ -5575,6 +5908,7 @@ const ConsultScreen = ({
       up(d => {
         d.orientacoes.push({
           id: uid(),
+          um: Date.now(),
           consultorId: modal.c.id,
           ts: Date.now(),
           ...v
@@ -5709,7 +6043,7 @@ const MarketScreen = ({
     })
   }, "pedido"), /*#__PURE__*/React.createElement(BtnDel, {
     onDel: () => up(d => {
-      d.fornecedores = d.fornecedores.filter(x => x.id !== f.id);
+      delReg(d, "fornecedores", f.id);
     })
   }))))), s.pedidos.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(H2, null, "Pedidos"), s.pedidos.sort((a, b) => b.ts - a.ts).slice(0, 6).map(p => {
     const f = s.fornecedores.find(x => x.id === p.fornecedorId);
@@ -5757,11 +6091,14 @@ const MarketScreen = ({
       },
       onClick: () => up(d => {
         const x = d.pedidos.find(y => y.id === p.id);
-        if (x) x.status = "recebido";
+        if (x) {
+          x.status = "recebido";
+          x.um = Date.now();
+        }
       })
     }, "chegou"), /*#__PURE__*/React.createElement(BtnDel, {
       onDel: () => up(d => {
-        d.pedidos = d.pedidos.filter(x => x.id !== p.id);
+        delReg(d, "pedidos", p.id);
       })
     }))), p.status !== "recebido" && /*#__PURE__*/React.createElement("div", {
       style: {
@@ -5809,6 +6146,7 @@ const MarketScreen = ({
       up(d => {
         d.fornecedores.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });
       });
@@ -5847,6 +6185,7 @@ const MarketScreen = ({
       up(d => {
         d.pedidos.push({
           id: uid(),
+          um: Date.now(),
           ts: Date.now(),
           status: "aberto",
           ...v
@@ -5921,7 +6260,7 @@ const VendasScreen = ({
       })
     }, "entregar"), /*#__PURE__*/React.createElement(BtnDel, {
       onDel: () => up(d => {
-        d.vendasPedidos = d.vendasPedidos.filter(x => x.id !== p.id);
+        delReg(d, "vendasPedidos", p.id);
       })
     }))));
   };
@@ -5984,7 +6323,7 @@ const VendasScreen = ({
     }
   }, [c.endereco || c.local, c.contato, c.preparoPreferido ? `prefere: ${c.preparoPreferido.toLowerCase()}` : null].filter(Boolean).join(" · "))), /*#__PURE__*/React.createElement(BtnDel, {
     onDel: () => up(d => {
-      d.clientes = d.clientes.filter(x => x.id !== c.id);
+      delReg(d, "clientes", c.id);
     })
   }))))), entregues.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(H2, null, "Entregas recentes"), entregues.map(cartaoPedido)), s.clientes.length === 0 && abertas.length === 0 && /*#__PURE__*/React.createElement(Vazio, null, "Cadastre mercados, peixarias, frigoríficos e consumidores", /*#__PURE__*/React.createElement("br", null), "e registre encomendas de peixe e alevino.", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", {
     style: {
@@ -6026,6 +6365,7 @@ const VendasScreen = ({
       up(d => {
         d.clientes.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });
       });
@@ -6090,6 +6430,7 @@ const VendasScreen = ({
       up(d => {
         d.vendasPedidos.push({
           id: uid(),
+          um: Date.now(),
           ts: Date.now(),
           status: "aberta",
           ...v,
@@ -6617,16 +6958,19 @@ const CertScreen = ({
     onFechar: () => setModal(null),
     campos: CAMPOS_ITEM_CERT,
     onExcluir: modal.tipo === "editar" ? () => up(d => {
-      d.certificacoes = d.certificacoes.filter(x => x.id !== modal.cert.id);
+      delReg(d, "certificacoes", modal.cert.id);
     }) : undefined,
     onSalvar: v => {
       up(d => {
         if (modal.tipo === "novo") d.certificacoes.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });else {
           const c = d.certificacoes.find(x => x.id === modal.cert.id);
-          Object.assign(c, v);
+          Object.assign(c, v, {
+            um: Date.now()
+          });
         }
       });
       setModal(null);
@@ -6681,7 +7025,7 @@ const CertScreen = ({
     }, "O checklist padrão das 3 esferas é criado automaticamente pro cliente.") : undefined,
     onExcluir: modal.tipo === "editarCli" ? () => {
       up(d => {
-        d.certClientes = d.certClientes.filter(x => x.id !== modal.cli.id);
+        delReg(d, "certClientes", modal.cli.id);
       });
       setSelCli(null);
     } : undefined,
@@ -6689,11 +7033,14 @@ const CertScreen = ({
       up(d => {
         if (modal.tipo === "novoCli") d.certClientes.push({
           id: uid(),
+          um: Date.now(),
           ...v,
           itens: CHECKLIST_CERT()
         });else {
           const c = d.certClientes.find(x => x.id === modal.cli.id);
-          Object.assign(c, v);
+          Object.assign(c, v, {
+            um: Date.now()
+          });
         }
       });
       setModal(null);
@@ -6706,6 +7053,7 @@ const CertScreen = ({
     onExcluir: modal.tipo === "editarItemCli" ? () => up(d => {
       const c = d.certClientes.find(x => x.id === cliente.id);
       c.itens = (c.itens || []).filter(i => i.id !== modal.cert.id);
+      c.um = Date.now();
     }) : undefined,
     onSalvar: v => {
       up(d => {
@@ -6715,8 +7063,11 @@ const CertScreen = ({
           ...v
         }];else {
           const i = c.itens.find(x => x.id === modal.cert.id);
-          Object.assign(i, v);
+          Object.assign(i, v, {
+            um: Date.now()
+          });
         }
+        c.um = Date.now();
       });
       setModal(null);
     }
@@ -6855,20 +7206,22 @@ const InterScreen = ({
       def: "aberto"
     }],
     onExcluir: modal.tipo === "editar" ? () => up(d => {
-      d.negocios = d.negocios.filter(x => x.id !== modal.neg.id);
+      delReg(d, "negocios", modal.neg.id);
     }) : undefined,
     onSalvar: v => {
       const comissaoValor = (v.valor || 0) * (v.comissaoPct || 0) / 100;
       up(d => {
         if (modal.tipo === "novo") d.negocios.push({
           id: uid(),
+          um: Date.now(),
           ts: Date.now(),
           ...v,
           comissaoValor
         });else {
           const n = d.negocios.find(x => x.id === modal.neg.id);
           Object.assign(n, v, {
-            comissaoValor
+            comissaoValor,
+            um: Date.now()
           });
         }
       });
@@ -7039,16 +7392,19 @@ const LojaScreen = ({
       largo: true
     }],
     onExcluir: modal.tipo === "editar" ? () => up(d => {
-      d.lojaCatalogo = d.lojaCatalogo.filter(x => x.id !== modal.item.id);
+      delReg(d, "lojaCatalogo", modal.item.id);
     }) : undefined,
     onSalvar: v => {
       up(d => {
         if (modal.tipo === "novo") d.lojaCatalogo.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });else {
           const i = d.lojaCatalogo.find(x => x.id === modal.item.id);
-          Object.assign(i, v);
+          Object.assign(i, v, {
+            um: Date.now()
+          });
         }
       });
       setModal(null);
@@ -7214,16 +7570,19 @@ const EduScreen = ({
       largo: true
     }],
     onExcluir: modal.tipo === "editar" ? () => up(d => {
-      d.cursos = d.cursos.filter(x => x.id !== modal.curso.id);
+      delReg(d, "cursos", modal.curso.id);
     }) : undefined,
     onSalvar: v => {
       up(d => {
         if (modal.tipo === "novo") d.cursos.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });else {
           const c = d.cursos.find(x => x.id === modal.curso.id);
-          Object.assign(c, v);
+          Object.assign(c, v, {
+            um: Date.now()
+          });
         }
       });
       setModal(null);
@@ -7450,16 +7809,19 @@ const PlanosScreen = ({
       largo: true
     }],
     onExcluir: modal.tipo === "editarPat" ? () => up(d => {
-      d.patrocinios = d.patrocinios.filter(x => x.id !== modal.pat.id);
+      delReg(d, "patrocinios", modal.pat.id);
     }) : undefined,
     onSalvar: v => {
       up(d => {
         if (modal.tipo === "novoPat") d.patrocinios.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });else {
           const p = d.patrocinios.find(x => x.id === modal.pat.id);
-          Object.assign(p, v);
+          Object.assign(p, v, {
+            um: Date.now()
+          });
         }
       });
       setModal(null);
@@ -7495,16 +7857,19 @@ const PlanosScreen = ({
       largo: true
     }],
     onExcluir: modal.tipo === "editar" ? () => up(d => {
-      d.planos = d.planos.filter(x => x.id !== modal.plano.id);
+      delReg(d, "planos", modal.plano.id);
     }) : undefined,
     onSalvar: v => {
       up(d => {
         if (modal.tipo === "novo") d.planos.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });else {
           const p = d.planos.find(x => x.id === modal.plano.id);
-          Object.assign(p, v);
+          Object.assign(p, v, {
+            um: Date.now()
+          });
         }
       });
       setModal(null);
@@ -7529,9 +7894,17 @@ const ESTRUTURAS = ["Suspenso em geomembrana", "Escavado", "Tanque-rede", "Alven
 const ESPECIES_WIZ = ["Tilápia GIFT", "Tilápia (outra)", "Tambaqui", "Camarão (L. vannamei)", "Pirarucu", "Outra"];
 const OnboardingWizard = ({
   aoConcluir,
-  temSeed
+  temSeed,
+  aoEntrarNuvem
 }) => {
   const [passo, setPasso] = useState(0);
+  const [modoNuvem, setModoNuvem] = useState(false);
+  const [nuvem, setNuvem] = useState({
+    rotulo: "",
+    senha: "",
+    erro: null,
+    carregando: false
+  });
   const [dados, setDados] = useState({
     nomeFazenda: "",
     nomePessoa: "",
@@ -7698,7 +8071,96 @@ const OnboardingWizard = ({
       background: `linear-gradient(90deg, ${C.ouro}, ${C.ouroClaro})`,
       transition: "width .3s"
     }
-  })), passo === 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  })), modoNuvem && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: SERIF,
+      fontSize: 21,
+      fontWeight: 700,
+      color: C.ink,
+      marginBottom: 4
+    }
+  }, "Entrar na fazenda da equipe"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.ink2,
+      lineHeight: 1.55,
+      marginBottom: 16
+    }
+  }, "Sua equipe já usa o ALUVI? Digite o ", /*#__PURE__*/React.createElement("b", null, "nome da fazenda na nuvem"), " e a ", /*#__PURE__*/React.createElement("b", null, "senha da equipe"), " que o administrador definiu — todos os dados descem pra este aparelho e tudo passa a sincronizar."), /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: C.ink2,
+      display: "block",
+      marginBottom: 5
+    }
+  }, "Nome da fazenda na nuvem *"), /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...inp,
+      marginBottom: 12
+    },
+    placeholder: "ex.: aguas-douradas",
+    value: nuvem.rotulo,
+    onChange: e => setNuvem({
+      ...nuvem,
+      rotulo: e.target.value,
+      erro: null
+    })
+  }), /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: C.ink2,
+      display: "block",
+      marginBottom: 5
+    }
+  }, "Senha da equipe *"), /*#__PURE__*/React.createElement("input", {
+    type: "password",
+    style: {
+      ...inp,
+      marginBottom: 8
+    },
+    value: nuvem.senha,
+    onChange: e => setNuvem({
+      ...nuvem,
+      senha: e.target.value,
+      erro: null
+    })
+  }), nuvem.erro && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.crit,
+      marginBottom: 8,
+      lineHeight: 1.5
+    }
+  }, "⚠ ", nuvem.erro), /*#__PURE__*/React.createElement(Btn, {
+    disabled: !nuvem.rotulo.trim() || !nuvem.senha || nuvem.carregando,
+    onClick: async () => {
+      setNuvem(n => ({
+        ...n,
+        carregando: true,
+        erro: null
+      }));
+      const erro = await aoEntrarNuvem(nuvem.rotulo, nuvem.senha);
+      if (erro) setNuvem(n => ({
+        ...n,
+        carregando: false,
+        erro
+      }));
+    }
+  }, nuvem.carregando ? "Conectando…" : "Entrar na fazenda ☁️"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModoNuvem(false),
+    style: {
+      background: "none",
+      border: "none",
+      color: C.muted,
+      cursor: "pointer",
+      fontSize: 11,
+      marginTop: 12,
+      width: "100%",
+      textDecoration: "underline"
+    }
+  }, "← voltar ao cadastro novo")), !modoNuvem && passo === 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: SERIF,
       fontSize: 21,
@@ -7761,7 +8223,7 @@ const OnboardingWizard = ({
     style: {
       color: C.ouroClaro
     }
-  }, "Administrador master"), " — só esse cargo cadastra funcionários e define quem pode lançar ou editar dados (Config → Equipe).")), passo === 1 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, "Administrador master"), " — só esse cargo cadastra funcionários e define quem pode lançar ou editar dados (Config → Equipe).")), !modoNuvem && passo === 1 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: SERIF,
       fontSize: 21,
@@ -7778,7 +8240,7 @@ const OnboardingWizard = ({
       ...dados,
       sistema: sx.v
     })
-  }))), passo === 2 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }))), !modoNuvem && passo === 2 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: SERIF,
       fontSize: 21,
@@ -7794,7 +8256,7 @@ const OnboardingWizard = ({
       ...dados,
       estrutura: e
     })
-  }))), passo === 3 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }))), !modoNuvem && passo === 3 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: SERIF,
       fontSize: 21,
@@ -7815,7 +8277,7 @@ const OnboardingWizard = ({
       fontSize: 11,
       color: C.muted
     }
-  }, "Dá pra ter mais de uma — essa é só a principal, e cada lote registra a sua.")), passo === 4 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, "Dá pra ter mais de uma — essa é só a principal, e cada lote registra a sua.")), !modoNuvem && passo === 4 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: SERIF,
       fontSize: 21,
@@ -7970,7 +8432,7 @@ const OnboardingWizard = ({
       color: C.muted,
       marginTop: 8
     }
-  }, dados.tanques.length, " tanque(s) cadastrado(s). Dá pra editar tudo depois em Tanques & Lotes.")), /*#__PURE__*/React.createElement("div", {
+  }, dados.tanques.length, " tanque(s) cadastrado(s). Dá pra editar tudo depois em Tanques & Lotes.")), !modoNuvem && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8,
@@ -7985,7 +8447,21 @@ const OnboardingWizard = ({
   }, "← Voltar"), /*#__PURE__*/React.createElement(Btn, {
     disabled: !podeAvancar,
     onClick: () => passo < TOTAL - 1 ? setPasso(passo + 1) : concluir()
-  }, passo < TOTAL - 1 ? "Continuar →" : "Concluir cadastro 🐟")), temSeed && passo === 0 && /*#__PURE__*/React.createElement("button", {
+  }, passo < TOTAL - 1 ? "Continuar →" : "Concluir cadastro 🐟")), !modoNuvem && passo === 0 && aoEntrarNuvem && /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModoNuvem(true),
+    style: {
+      background: C.ouroBg,
+      border: `1px solid ${C.ouro}44`,
+      color: C.ouroClaro,
+      cursor: "pointer",
+      fontSize: 12.5,
+      fontWeight: 700,
+      marginTop: 14,
+      width: "100%",
+      padding: "11px",
+      borderRadius: 10
+    }
+  }, "☁️ Minha equipe já usa o ALUVI — entrar na fazenda da nuvem"), temSeed && passo === 0 && /*#__PURE__*/React.createElement("button", {
     onClick: () => aoConcluir(null),
     style: {
       background: "none",
@@ -8726,7 +9202,8 @@ const ConfigScreen = () => {
     importAll,
     usuario,
     perm,
-    sair
+    sair,
+    sync
   } = useApp();
   const [modal, setModal] = useState(null);
   const [confirma, setConfirma] = useState(null); // 'limpar' | 'demo'
@@ -8889,8 +9366,9 @@ const ConfigScreen = () => {
     tipo: "escuro",
     onClick: () => up(d => {
       d.config.onboarded = false;
+      d.config.um = Date.now();
     })
-  }, "Refazer cadastro da piscicultura"))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+  }, "Refazer cadastro da piscicultura"))), /*#__PURE__*/React.createElement(NuvemCard, null), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       fontWeight: 700,
@@ -8968,17 +9446,20 @@ const ConfigScreen = () => {
       return null;
     },
     onExcluir: modal.tipo === "editarUsu" && s.usuarios.length > 1 && !(modal.usu.cargo === "Administrador master" && s.usuarios.filter(u => u.cargo === "Administrador master").length <= 1) ? () => up(d => {
-      d.usuarios = d.usuarios.filter(x => x.id !== modal.usu.id);
+      delReg(d, "usuarios", modal.usu.id);
       d.config.responsaveis = d.usuarios.map(u => u.nome);
     }) : undefined,
     onSalvar: v => {
       up(d => {
         if (modal.tipo === "novoUsu") d.usuarios.push({
           id: uid(),
+          um: Date.now(),
           ...v
         });else {
           const u = d.usuarios.find(x => x.id === modal.usu.id);
-          Object.assign(u, v);
+          Object.assign(u, v, {
+            um: Date.now()
+          });
         }
         d.config.responsaveis = d.usuarios.map(u => u.nome);
       });
@@ -9070,6 +9551,7 @@ const ConfigScreen = () => {
       up(d => {
         d.config.nomeFazenda = v.nomeFazenda;
         d.config.responsaveis = v.responsaveis.split(",").map(x => x.trim()).filter(Boolean);
+        d.config.um = Date.now();
       });
       setModal(null);
     }
@@ -9111,6 +9593,7 @@ const ConfigScreen = () => {
           d.config.faixas[k].max = v[k + "_max"];
         });
         if (v.metaFCA) d.config.metaFCA = v.metaFCA;
+        d.config.um = Date.now();
       });
       setModal(null);
     }
@@ -9182,6 +9665,7 @@ function demoData() {
   d.lotes = [loteB3, loteE1];
   [[40, 8], [33, 18], [26, 30], [19, 45], [12, 62], [5, 84]].forEach(([dias, peso]) => d.biometrias.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteB3.id,
     dataISO: diaN(dias),
     ts: Date.now() - dias * 86400000,
@@ -9192,6 +9676,7 @@ function demoData() {
   }));
   [[100, 120], [70, 230], [40, 380], [12, 540]].forEach(([dias, peso]) => d.biometrias.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteE1.id,
     dataISO: diaN(dias),
     ts: Date.now() - dias * 86400000,
@@ -9203,6 +9688,7 @@ function demoData() {
   for (let n = 10; n >= 1; n--) {
     d.parametros.push({
       id: uid(),
+      um: Date.now(),
       tanqueId: "B3",
       dataISO: diaN(n),
       ts: Date.now() - n * 86400000,
@@ -9220,6 +9706,7 @@ function demoData() {
     });
     d.parametros.push({
       id: uid(),
+      um: Date.now(),
       tanqueId: "E1",
       dataISO: diaN(n),
       ts: Date.now() - n * 86400000 + 1,
@@ -9250,6 +9737,7 @@ function demoData() {
     [["08:00", 7.6], ["12:00", 7.7], ["17:00", 7.7]].forEach(([hora, kg], i) => {
       d.arracoamentos.push({
         id: uid(),
+        um: Date.now(),
         loteId: loteB3.id,
         dataISO: diaN(n),
         ts: Date.now() - n * 86400000 + i,
@@ -9261,6 +9749,7 @@ function demoData() {
       });
       d.movsEstoque.push({
         id: uid(),
+        um: Date.now(),
         itemId: racaoCresc.id,
         dataISO: diaN(n),
         ts: Date.now() - n * 86400000 + i,
@@ -9270,6 +9759,7 @@ function demoData() {
       });
       d.custos.push({
         id: uid(),
+        um: Date.now(),
         loteId: loteB3.id,
         dataISO: diaN(n),
         ts: Date.now(),
@@ -9280,6 +9770,7 @@ function demoData() {
       });
       d.arracoamentos.push({
         id: uid(),
+        um: Date.now(),
         loteId: loteE1.id,
         dataISO: diaN(n),
         ts: Date.now() - n * 86400000 + 10 + i,
@@ -9291,6 +9782,7 @@ function demoData() {
       });
       d.movsEstoque.push({
         id: uid(),
+        um: Date.now(),
         itemId: racaoEng.id,
         dataISO: diaN(n),
         ts: Date.now() - n * 86400000 + 10 + i,
@@ -9300,6 +9792,7 @@ function demoData() {
       });
       d.custos.push({
         id: uid(),
+        um: Date.now(),
         loteId: loteE1.id,
         dataISO: diaN(n),
         ts: Date.now(),
@@ -9312,6 +9805,7 @@ function demoData() {
   }
   d.arracoamentos.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteB3.id,
     dataISO: diaN(30),
     ts: Date.now() - 30 * 86400000,
@@ -9322,6 +9816,7 @@ function demoData() {
   });
   d.custos.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteB3.id,
     dataISO: diaN(30),
     ts: Date.now() - 30 * 86400000,
@@ -9332,6 +9827,7 @@ function demoData() {
   });
   d.arracoamentos.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteE1.id,
     dataISO: diaN(60),
     ts: Date.now() - 60 * 86400000,
@@ -9342,6 +9838,7 @@ function demoData() {
   });
   d.custos.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteE1.id,
     dataISO: diaN(60),
     ts: Date.now() - 60 * 86400000,
@@ -9352,6 +9849,7 @@ function demoData() {
   });
   [[30, 12, "Qualidade de água"], [18, 5, "Manejo"], [6, 3, "Desconhecida"]].forEach(([n, q, causa]) => d.mortalidades.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteB3.id,
     dataISO: diaN(n),
     ts: Date.now() - n * 86400000,
@@ -9361,6 +9859,7 @@ function demoData() {
   }));
   d.mortalidades.push({
     id: uid(),
+    um: Date.now(),
     loteId: loteE1.id,
     dataISO: diaN(9),
     ts: Date.now() - 9 * 86400000,
@@ -9371,6 +9870,7 @@ function demoData() {
   });
   d.custos.push({
     id: uid(),
+    um: Date.now(),
     loteId: null,
     dataISO: diaN(15),
     ts: Date.now(),
@@ -9380,6 +9880,7 @@ function demoData() {
   });
   d.custos.push({
     id: uid(),
+    um: Date.now(),
     loteId: null,
     dataISO: diaN(10),
     ts: Date.now(),
@@ -9389,6 +9890,7 @@ function demoData() {
   });
   d.correcoes.push({
     id: uid(),
+    um: Date.now(),
     tanqueId: "B3",
     dataISO: diaN(2),
     ts: Date.now() - 2 * 86400000,
@@ -9403,6 +9905,7 @@ function demoData() {
   });
   d.lembretes.push({
     id: uid(),
+    um: Date.now(),
     dataISO: diaN(0),
     titulo: "Re-medir água de B3 (48h após Probiótico)",
     origem: "Correção",
@@ -9426,6 +9929,7 @@ function demoData() {
   };
   d.equipamentos.push({
     id: uid(),
+    um: Date.now(),
     nome: "Soprador #1",
     marca: "JKW",
     modelo: "JKW007",
@@ -9439,6 +9943,7 @@ function demoData() {
   });
   d.equipamentos.push({
     id: uid(),
+    um: Date.now(),
     nome: "Soprador #2",
     marca: "JKW",
     modelo: "JKW007",
@@ -9452,6 +9957,7 @@ function demoData() {
   });
   d.patrocinios.push({
     id: uid(),
+    um: Date.now(),
     marca: "Guabi Nutrição Animal",
     texto: "Ração Pirá — desempenho que vira lucro no seu tanque",
     valorMes: 800,
@@ -9459,6 +9965,7 @@ function demoData() {
   });
   d.consultores.push({
     id: uid(),
+    um: Date.now(),
     nome: "Dr. Pedro (eng. de pesca)",
     especialidade: "Bioflocos · Nutrição",
     local: "BA",
@@ -9466,6 +9973,7 @@ function demoData() {
   });
   d.orientacoes.push({
     id: uid(),
+    um: Date.now(),
     consultorId: d.consultores[0].id,
     dataISO: diaN(2),
     tanqueId: "B3",
@@ -9474,6 +9982,7 @@ function demoData() {
   });
   d.fornecedores.push({
     id: uid(),
+    um: Date.now(),
     nome: "Agropec Nordeste",
     categoria: "Ração",
     local: "Vitória da Conquista/BA",
@@ -9482,6 +9991,7 @@ function demoData() {
   });
   d.fornecedores.push({
     id: uid(),
+    um: Date.now(),
     nome: "Aquafish (Diogo)",
     categoria: "Alevinos",
     local: "BA",
@@ -9490,6 +10000,7 @@ function demoData() {
   });
   d.clientes.push({
     id: uid(),
+    um: Date.now(),
     nome: "Peixaria Central",
     tipo: "Peixaria",
     local: "Livramento/BA",
@@ -9497,12 +10008,14 @@ function demoData() {
   });
   d.clientes.push({
     id: uid(),
+    um: Date.now(),
     nome: "Mercado Bom Preço",
     tipo: "Mercado",
     local: "Livramento/BA"
   });
   d.vendasPedidos.push({
     id: uid(),
+    um: Date.now(),
     ts: Date.now(),
     dataISO: diaN(1),
     clienteId: d.clientes[0].id,
@@ -9513,6 +10026,7 @@ function demoData() {
   });
   d.negocios.push({
     id: uid(),
+    um: Date.now(),
     ts: Date.now(),
     dataISO: diaN(4),
     tipo: "Insumo",
@@ -9526,6 +10040,7 @@ function demoData() {
   });
   d.lojaCatalogo.push({
     id: uid(),
+    um: Date.now(),
     produto: "Ração Pirá Engorda 6-8mm 25kg",
     marca: "Guabi",
     categoria: "Ração",
@@ -9534,6 +10049,7 @@ function demoData() {
   });
   d.lojaCatalogo.push({
     id: uid(),
+    um: Date.now(),
     produto: "N-Aqua 1kg",
     marca: "Kayros",
     categoria: "Probióticos",
@@ -9542,6 +10058,7 @@ function demoData() {
   });
   d.lojaCatalogo.push({
     id: uid(),
+    um: Date.now(),
     produto: "Soprador radial 1,5cv",
     marca: "JKW",
     categoria: "Equipamentos",
@@ -9549,6 +10066,7 @@ function demoData() {
   });
   d.cursos.push({
     id: uid(),
+    um: Date.now(),
     titulo: "Manual de criação de tilápia em BFT",
     tipo: "Manual",
     tema: "Bioflocos",
@@ -9557,6 +10075,7 @@ function demoData() {
   });
   d.cursos.push({
     id: uid(),
+    um: Date.now(),
     titulo: "Gestão de custos na piscicultura",
     tipo: "Curso",
     tema: "Gestão",
@@ -9682,20 +10201,141 @@ function AppCarregado({
   const [s, setS] = useState(carga.data);
   const [usuario, setUsuario] = useState(null);
   const engineRef = useRef(carga.engine);
+  /* ---- ALUVI Cloud ---- */
+  const [syncStatus, setSyncStatus] = useState("ok");
+  const [syncUltima, setSyncUltima] = useState(null);
+  const sRef = useRef(s);
+  sRef.current = s;
+  const dirtyRef = useRef(false);
+  const lastRevRef = useRef(0);
+  const rodandoRef = useRef(false);
+  const pushTimer = useRef(null);
+  const aplicar = d => {
+    setS(d);
+    sRef.current = d;
+    persist(d, engineRef.current);
+  };
+  const sincronizar = async () => {
+    const nv = sRef.current.config.nuvem;
+    if (!nv?.ativa || rodandoRef.current) return;
+    rodandoRef.current = true;
+    try {
+      setSyncStatus("sincronizando");
+      let remoto = await nuvemGet(nv.id, false);
+      if (!remoto) {
+        const criou = await nuvemInsert(nv.id, sRef.current);
+        if (criou) {
+          lastRevRef.current = 1;
+          dirtyRef.current = false;
+          setSyncStatus("ok");
+          setSyncUltima(Date.now());
+          return;
+        }
+        remoto = await nuvemGet(nv.id, false);
+        if (!remoto) throw new Error("sem doc");
+      }
+      let base = remoto.rev;
+      let merged = mesclarStores(sRef.current, remoto.dados);
+      const mergedStr = JSON.stringify(merged);
+      if (mergedStr !== JSON.stringify(sRef.current)) aplicar(merged);
+      if (mergedStr !== JSON.stringify(remoto.dados)) {
+        for (let i = 0; i < 3; i++) {
+          const okUp = await nuvemUpdate(nv.id, sRef.current, base);
+          if (okUp) {
+            base = base + 1;
+            break;
+          }
+          remoto = await nuvemGet(nv.id, false);
+          if (!remoto) break;
+          base = remoto.rev;
+          const m2 = mesclarStores(sRef.current, remoto.dados);
+          aplicar(m2);
+        }
+      }
+      lastRevRef.current = base;
+      dirtyRef.current = false;
+      setSyncStatus("ok");
+      setSyncUltima(Date.now());
+    } catch (e) {
+      setSyncStatus(navigator.onLine === false ? "offline" : "erro");
+    } finally {
+      rodandoRef.current = false;
+    }
+  };
+  useEffect(() => {
+    const iv = setInterval(async () => {
+      const nv = sRef.current.config.nuvem;
+      if (!nv?.ativa || rodandoRef.current) return;
+      if (dirtyRef.current) {
+        sincronizar();
+        return;
+      }
+      try {
+        const r = await nuvemGet(nv.id, true);
+        if (!r || r.rev !== lastRevRef.current) sincronizar();else setSyncStatus("ok");
+      } catch (e) {
+        setSyncStatus(navigator.onLine === false ? "offline" : "erro");
+      }
+    }, 12000);
+    const onVis = () => {
+      if (document.visibilityState === "visible") sincronizar();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    const onOnline = () => sincronizar();
+    window.addEventListener("online", onOnline);
+    setTimeout(() => sincronizar(), 800);
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("online", onOnline);
+    };
+  }, []);
+  const entrarNuvem = async (rotulo, senha) => {
+    try {
+      const id = await chaveFazenda(rotulo, senha);
+      const remoto = await nuvemGet(id, false);
+      if (!remoto) return "Não achei essa fazenda na nuvem. Confira o nome e a senha — ou o administrador ainda não ligou a sincronização no aparelho dele.";
+      const dados = migrar(structuredClone(remoto.dados));
+      dados.config.nuvem = {
+        ativa: true,
+        id,
+        rotulo: rotulo.trim()
+      };
+      dados.config.onboarded = true;
+      aplicar(dados);
+      lastRevRef.current = remoto.rev;
+      dirtyRef.current = false;
+      setSyncStatus("ok");
+      setSyncUltima(Date.now());
+      return null;
+    } catch (e) {
+      return "Sem conexão com a nuvem agora. Tente de novo quando tiver internet.";
+    }
+  };
   const up = fn => setS(prev => {
     const d = structuredClone(prev);
     fn(d);
+    recalcEstoque(d);
+    sRef.current = d;
     persist(d, engineRef.current);
+    dirtyRef.current = true;
+    clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(() => sincronizar(), 2500);
     return d;
   });
   const resetAll = novo => {
     const d = migrar(novo);
-    setS(d);
-    persist(d, engineRef.current);
+    aplicar(d);
     setUsuario(null);
+    dirtyRef.current = true;
   };
   const importAll = dados => resetAll(dados);
   const perm = permDe(usuario);
+  const sync = {
+    status: syncStatus,
+    ultima: syncUltima,
+    agora: sincronizar
+  };
   const api = {
     s,
     up,
@@ -9704,12 +10344,14 @@ function AppCarregado({
     importAll,
     usuario,
     perm,
-    sair: () => setUsuario(null)
+    sair: () => setUsuario(null),
+    sync
   };
   if (!s.config.onboarded) {
     const temSeed = s.tanques.length > 0;
     return /*#__PURE__*/React.createElement(OnboardingWizard, {
       temSeed: temSeed,
+      aoEntrarNuvem: entrarNuvem,
       aoConcluir: dados => {
         up(d => {
           if (dados) {
@@ -9726,12 +10368,18 @@ function AppCarregado({
             d.config.responsaveis = d.usuarios.map(u => u.nome);
             const semDados = d.lotes.length + d.parametros.length + d.movsEstoque.length === 0;
             if (dados.tanques.length) {
+              const ids = dados.tanques.map(t => t.id);
+              d.deletados = (d.deletados || []).filter(x => !ids.includes(x));
+              dados.tanques.forEach(t => {
+                t.um = Date.now();
+              });
               if (semDados) d.tanques = dados.tanques;else dados.tanques.forEach(t => {
                 if (!d.tanques.some(x => x.id === t.id)) d.tanques.push(t);
               });
             }
           }
           d.config.onboarded = true;
+          d.config.um = Date.now();
         });
       }
     });
@@ -9836,7 +10484,14 @@ function AppCarregado({
       fontSize: 11,
       color: C.muted
     }
-  }, usuario.nome, " · ", usuario.cargo, /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement(SyncDot, {
+    sync: sync,
+    nuvemAtiva: !!s.config.nuvem?.ativa
+  })), usuario.nome, " · ", usuario.cargo, /*#__PURE__*/React.createElement("button", {
     onClick: () => setUsuario(null),
     style: {
       background: "none",
@@ -9862,10 +10517,16 @@ function AppCarregado({
       background: `linear-gradient(180deg, ${C.bg1}, ${C.bg1}f2)`,
       backdropFilter: "blur(8px)",
       borderBottom: `1px solid ${C.line}`,
-      padding: "10px 14px"
+      padding: "10px 14px",
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center"
     }
   }, /*#__PURE__*/React.createElement(Marca, {
     compacta: true
+  }), /*#__PURE__*/React.createElement(SyncDot, {
+    sync: sync,
+    nuvemAtiva: !!s.config.nuvem?.ativa
   })), /*#__PURE__*/React.createElement("div", {
     style: {
       maxWidth: desktop ? 760 : 560,
