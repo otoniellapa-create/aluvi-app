@@ -49,6 +49,125 @@
 </head>
 <body>
 <div id="root"></div>
+<script>
+/* ===================================================================
+   ALUVI — Login individual (camada de autenticação Supabase Auth)
+   Bloqueia o app até haver uma sessão válida. Contas são criadas só
+   pelo administrador (cadastro público desativado no painel).
+   =================================================================== */
+(function () {
+  var SUPA_URL = "https://ztfpeabfhuwdtdpvftft.supabase.co";
+  var SUPA_KEY = "sb_publishable_skyJRqJCQverL_eDYGUZvg_0KvPp4hC";
+  var LS = "aluvi_sessao";
+  var session = null;
+  var overlay = null;
+
+  function salvar(s) {
+    session = s;
+    try { s ? localStorage.setItem(LS, JSON.stringify(s)) : localStorage.removeItem(LS); } catch (e) {}
+  }
+  function carregar() {
+    try { var r = localStorage.getItem(LS); if (r) session = JSON.parse(r); } catch (e) {}
+  }
+  function valido() {
+    return !!(session && session.access_token && session.expires_at &&
+      (session.expires_at * 1000 - Date.now() > 60000));
+  }
+  function normaliza(d, emailFallback) {
+    return {
+      access_token: d.access_token,
+      refresh_token: d.refresh_token,
+      expires_at: d.expires_at || (Math.floor(Date.now() / 1000) + (d.expires_in || 3600)),
+      email: (d.user && d.user.email) || emailFallback
+    };
+  }
+  async function login(email, senha) {
+    var r = await fetch(SUPA_URL + "/auth/v1/token?grant_type=password", {
+      method: "POST",
+      headers: { apikey: SUPA_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, password: senha })
+    });
+    var d = await r.json().catch(function () { return {}; });
+    if (!r.ok) throw new Error(d.error_description || d.msg || d.error || ("Falha no login (" + r.status + ")"));
+    salvar(normaliza(d, email));
+    return true;
+  }
+  async function refresh() {
+    if (!session || !session.refresh_token) return false;
+    try {
+      var r = await fetch(SUPA_URL + "/auth/v1/token?grant_type=refresh_token", {
+        method: "POST",
+        headers: { apikey: SUPA_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: session.refresh_token })
+      });
+      if (!r.ok) { salvar(null); return false; }
+      var d = await r.json();
+      salvar(normaliza(d, session.email));
+      return true;
+    } catch (e) { return false; }
+  }
+  function mostrar() { if (overlay) overlay.style.display = "flex"; }
+  function esconder() { if (overlay) overlay.style.display = "none"; }
+  function logout() { salvar(null); mostrar(); }
+
+  window.__aluviAuth = {
+    getToken: function () { return session ? session.access_token : null; },
+    autenticado: function () { return !!(session && session.access_token); },
+    email: function () { return session ? session.email : null; },
+    logout: logout
+  };
+
+  function construirOverlay() {
+    overlay = document.createElement("div");
+    overlay.id = "aluvi-login";
+    overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:#0A1D31;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:24px";
+    overlay.innerHTML =
+      '<div style="width:100%;max-width:360px;text-align:center">' +
+        '<div style="font-family:Georgia,serif;letter-spacing:4px;font-size:34px;color:#F5F1E6">ALUVI</div>' +
+        '<div style="color:#C9A227;letter-spacing:3px;font-size:12px;margin-bottom:28px">GEST&Atilde;O INTELIGENTE</div>' +
+        '<div style="color:#F5F1E6;font-size:15px;margin-bottom:18px">Entre com sua conta para continuar</div>' +
+        '<input id="aluvi-email" type="email" autocomplete="username" placeholder="seu e-mail" style="width:100%;box-sizing:border-box;padding:13px 14px;margin-bottom:10px;border-radius:10px;border:1px solid #24425f;background:#0d243b;color:#F5F1E6;font-size:15px">' +
+        '<input id="aluvi-senha" type="password" autocomplete="current-password" placeholder="sua senha" style="width:100%;box-sizing:border-box;padding:13px 14px;margin-bottom:14px;border-radius:10px;border:1px solid #24425f;background:#0d243b;color:#F5F1E6;font-size:15px">' +
+        '<button id="aluvi-entrar" style="width:100%;padding:14px;border:none;border-radius:10px;background:#C9A227;color:#0A1D31;font-weight:700;font-size:15px;cursor:pointer">Entrar</button>' +
+        '<div id="aluvi-erro" style="color:#ff8a80;font-size:13px;margin-top:12px;min-height:18px"></div>' +
+        '<div style="color:#6f8aa5;font-size:12px;margin-top:18px;line-height:1.5">Acesso apenas para contas autorizadas pelo administrador.<br>Esqueceu a senha? Fale com o administrador.</div>' +
+      '</div>';
+    document.body.appendChild(overlay);
+    var email = overlay.querySelector("#aluvi-email");
+    var senha = overlay.querySelector("#aluvi-senha");
+    var btn = overlay.querySelector("#aluvi-entrar");
+    var erro = overlay.querySelector("#aluvi-erro");
+    async function tentar() {
+      erro.textContent = "";
+      if (!email.value || !senha.value) { erro.textContent = "Preencha e-mail e senha."; return; }
+      btn.disabled = true; btn.textContent = "Entrando…";
+      try { await login(email.value.trim(), senha.value); senha.value = ""; esconder(); }
+      catch (e) { erro.textContent = e.message || "Não foi possível entrar."; }
+      finally { btn.disabled = false; btn.textContent = "Entrar"; }
+    }
+    btn.addEventListener("click", tentar);
+    senha.addEventListener("keydown", function (ev) { if (ev.key === "Enter") tentar(); });
+    email.addEventListener("keydown", function (ev) { if (ev.key === "Enter") senha.focus(); });
+  }
+
+  setInterval(function () {
+    if (session && session.expires_at && (session.expires_at * 1000 - Date.now() < 120000)) refresh();
+  }, 60000);
+
+  async function iniciar() {
+    carregar();
+    construirOverlay();
+    if (valido()) { esconder(); return; }
+    if (session && session.refresh_token) {
+      if (navigator.onLine === false) { esconder(); return; } /* offline: mantém sessão local já existente */
+      if (await refresh()) { esconder(); return; }
+    }
+    mostrar();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", iniciar);
+  else iniciar();
+})();
+</script>
 <script>/**
  * @license React
  * react.production.min.js
@@ -2311,15 +2430,20 @@ async function sha256hex(txt) {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 const chaveFazenda = async (rotulo, senha) => "fz_" + (await sha256hex(`aluvi|${(rotulo || "").trim().toLowerCase()}|${senha || ""}`)).slice(0, 40);
-const supaHeaders = (extra, fazendaId) => ({
-  apikey: SUPA_KEY,
-  Authorization: `Bearer ${SUPA_KEY}`,
-  "Content-Type": "application/json",
-  /* O banco exige este cabeçalho: sem ele, nenhuma linha é visível (política RLS).
-     Impede que alguém liste todas as fazendas sem conhecer o token secreto. */
-  ...(fazendaId ? { "x-fazenda": fazendaId } : {}),
-  ...extra
-});
+const supaHeaders = (extra, fazendaId) => {
+  /* Usa o token do usuário logado (login individual). Sem sessão, cai na chave
+     pública — que o banco recusa, porque as políticas exigem usuário autenticado. */
+  const tok = (window.__aluviAuth && window.__aluviAuth.getToken && window.__aluviAuth.getToken()) || SUPA_KEY;
+  return {
+    apikey: SUPA_KEY,
+    Authorization: `Bearer ${tok}`,
+    "Content-Type": "application/json",
+    /* O banco também exige este cabeçalho: sem ele, nenhuma linha é visível (RLS).
+       Impede listar todas as fazendas sem conhecer o token secreto da fazenda. */
+    ...(fazendaId ? { "x-fazenda": fazendaId } : {}),
+    ...extra
+  };
+};
 async function nuvemGet(fazendaId, soRev) {
   const sel = soRev ? "rev" : "rev,dados";
   const r = await fetch(`${SUPA_URL}/rest/v1/${SUPA_TB}?fazenda_id=eq.${encodeURIComponent(fazendaId)}&select=${sel}`, {
