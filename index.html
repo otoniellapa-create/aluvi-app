@@ -2287,16 +2287,19 @@ async function sha256hex(txt) {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 const chaveFazenda = async (rotulo, senha) => "fz_" + (await sha256hex(`aluvi|${(rotulo || "").trim().toLowerCase()}|${senha || ""}`)).slice(0, 40);
-const supaHeaders = extra => ({
+const supaHeaders = (extra, fazendaId) => ({
   apikey: SUPA_KEY,
   Authorization: `Bearer ${SUPA_KEY}`,
   "Content-Type": "application/json",
+  /* O banco exige este cabeçalho: sem ele, nenhuma linha é visível (política RLS).
+     Impede que alguém liste todas as fazendas sem conhecer o token secreto. */
+  ...(fazendaId ? { "x-fazenda": fazendaId } : {}),
   ...extra
 });
 async function nuvemGet(fazendaId, soRev) {
   const sel = soRev ? "rev" : "rev,dados";
   const r = await fetch(`${SUPA_URL}/rest/v1/${SUPA_TB}?fazenda_id=eq.${encodeURIComponent(fazendaId)}&select=${sel}`, {
-    headers: supaHeaders()
+    headers: supaHeaders({}, fazendaId)
   });
   if (!r.ok) throw new Error("nuvem GET " + r.status);
   const arr = await r.json();
@@ -2307,7 +2310,7 @@ async function nuvemInsert(fazendaId, dados) {
     method: "POST",
     headers: supaHeaders({
       Prefer: "return=minimal"
-    }),
+    }, fazendaId),
     body: JSON.stringify({
       fazenda_id: fazendaId,
       dados,
@@ -2323,7 +2326,7 @@ async function nuvemUpdate(fazendaId, dados, revBase) {
     method: "PATCH",
     headers: supaHeaders({
       Prefer: "return=representation"
-    }),
+    }, fazendaId),
     body: JSON.stringify({
       dados,
       rev: revBase + 1,
