@@ -1,4 +1,4 @@
-const CACHE = "aluvi-v32";
+const CACHE = "aluvi-v33";
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(["./", "./index.html"])).then(() => self.skipWaiting()));
@@ -10,6 +10,13 @@ self.addEventListener("activate", e => {
 
 self.addEventListener("fetch", e => {
   if (e.request.method !== "GET") return;
+
+  /* NUNCA interceptar chamadas para fora deste site (ex.: banco de dados Supabase).
+     Dado tem que vir sempre fresco da rede. Guardar resposta de API em cache faz o
+     app mostrar informacao antiga depois de salvar — parece que o dado "sumiu". */
+  let alvo;
+  try { alvo = new URL(e.request.url); } catch (_) { return; }
+  if (alvo.origin !== self.location.origin) return;
 
   const ehDocumento =
     e.request.mode === "navigate" ||
