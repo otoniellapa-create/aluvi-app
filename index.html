@@ -596,6 +596,118 @@ const FAIXAS_DEFAULT = {
   }
 };
 
+/* ===== Semáforo dos parâmetros =====
+   A faixa configurada (min/max) é o VERDE. Fora dela, mas antes do limite crítico,
+   é AMARELO (observar). Passando do crítico, é VERMELHO (agir e corrigir o manejo).
+   Cada parâmetro traz a ação sugerida. São SUGESTÕES técnicas — a decisão de manejo
+   é do produtor. Revise os limites com seu engenheiro. */
+const FAIXAS_CRIT = {
+  temp: {
+    critMin: 22,
+    critMax: 32,
+    acao: "Ajuste o arraçoamento pela temperatura: abaixo de 20 °C suspenda a ração; no calor forte reduza e reforce a aeração."
+  },
+  od: {
+    critMin: 3,
+    critMax: null,
+    acao: "Ligue/cheque a aeração AGORA e suspenda o arraçoamento até normalizar. Oxigênio baixo mata rápido."
+  },
+  ph: {
+    critMin: 6,
+    critMax: 9,
+    acao: "Corrija a alcalinidade e evite manejo estressante até estabilizar. Evite oscilação brusca."
+  },
+  amonia: {
+    critMin: null,
+    critMax: 2,
+    acao: "Reduza o arraçoamento, renove/trate a água e cheque a maturação do floco."
+  },
+  nitrito: {
+    critMin: null,
+    critMax: 1,
+    acao: "Reduza a ração e cheque o biofiltro/floco. Cloreto (sal) ajuda a proteger contra a toxicidade."
+  },
+  alcalinidade: {
+    critMin: 80,
+    critMax: 200,
+    acao: "Corrija com calcário/bicarbonato — alcalinidade baixa derruba o pH e desestabiliza o floco."
+  },
+  salinidade: {
+    critMin: 0.5,
+    critMax: 5,
+    acao: "Ajuste a salinidade conforme orientação técnica."
+  },
+  nitrato: {
+    critMin: null,
+    critMax: 100,
+    acao: "Renove parte da água."
+  },
+  dureza: {
+    critMin: 30,
+    critMax: null,
+    acao: "Corrija a dureza — ela sustenta o pH e o bem-estar do peixe."
+  },
+  solidos: {
+    critMin: 3,
+    critMax: 50,
+    acao: "Acima do limite, decante/remova o excesso de floco (consome oxigênio e entope brânquia). Abaixo, o floco está imaturo."
+  }
+};
+const AVISO_SUGESTAO = "Sugestão automática com base nos parâmetros. Não é prescrição — a decisão de manejo é de responsabilidade do produtor. Na dúvida, fale com um profissional habilitado.";
+
+/* ===== Rede de proteção contra erro de digitação =====
+   Não julga manejo — só pega o que é fisicamente improvável (pH 14, oxigênio 0,
+   temperatura 300). Esses números alimentam a sugestão de ração e a biometria:
+   um dígito errado envenena a inteligência inteira. Fora daqui o app pede confirmação. */
+const LIMITES_PLAUSIVEL = {
+  tempSup: [0, 45, "Temperatura (superfície)", "°C"],
+  tempMeio: [0, 45, "Temperatura (meio)", "°C"],
+  tempFundo: [0, 45, "Temperatura (fundo)", "°C"],
+  ph: [3, 12, "pH", ""],
+  od: [0.1, 20, "Oxigênio dissolvido", "mg/L"],
+  amonia: [0, 50, "Amônia total", "mg/L"],
+  nitrito: [0, 50, "Nitrito", "mg/L"],
+  alcalinidade: [0, 1000, "Alcalinidade", "mg/L"],
+  salinidade: [0, 50, "Salinidade", "ppt"],
+  nitrato: [0, 1000, "Nitrato", "mg/L"],
+  dureza: [0, 1000, "Dureza", "mg/L CaCO₃"],
+  solidos: [0, 200, "Sólidos sedim.", "mL/L"]
+};
+function valoresSuspeitos(v) {
+  const out = [];
+  Object.keys(LIMITES_PLAUSIVEL).forEach(k => {
+    const bruto = v[k];
+    if (bruto === null || bruto === undefined || bruto === "" || isNaN(Number(bruto))) return;
+    const [mn, mx, label, un] = LIMITES_PLAUSIVEL[k];
+    const n = Number(bruto);
+    if (n < mn || n > mx) out.push(`• ${label}: ${n}${un ? " " + un : ""} — esperado entre ${mn} e ${mx}`);
+  });
+  return out;
+}
+
+/* ===== Autoria automática =====
+   Quem lançou vem do USUÁRIO LOGADO (não de um nome digitado) e a hora é a do
+   momento do lançamento. Isso cria trilha confiável: ninguém lança no nome de
+   outra pessoa. Registros antigos seguem mostrando o campo antigo (resp). */
+function autoria() {
+  const email = window.__aluviAuth && window.__aluviAuth.email ? window.__aluviAuth.email() : null;
+  return {
+    porEmail: email || null,
+    porQuando: new Date().toISOString()
+  };
+}
+const autorDe = r => r && (r.porEmail || r.resp) || "";
+const quandoDe = r => {
+  if (!r || !r.porQuando) return "";
+  const d = new Date(r.porQuando);
+  return isNaN(d.getTime()) ? "" : d.toLocaleString("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+};
+
 /* tabela de referência de arraçoamento — tilápia (geral; ajuste com engenheiro/fabricante) */
 const TABELA_ARR = [{
   ate: 10,
@@ -667,6 +779,38 @@ const FATOR_TEMP = [{
   nota: "calor forte — reduzir muito"
 }];
 const fatorTemp = tC => tC === null || tC === undefined || isNaN(tC) ? null : FATOR_TEMP.find(f => tC < f.ate) || FATOR_TEMP[FATOR_TEMP.length - 1];
+/* ===== Curva de crescimento de referência — tilápia =====
+   Semana -> peso médio esperado (tabela SUGESTÃO ALIMENTAR, Guabi/Pirá).
+   Uso: ancora na gramatura de recepção do lote e lê o "peso ideal de hoje".
+   É referência de peixe saudável em boas condições — serve pra COMPARAR, não pra obedecer. */
+const CURVA_TILAPIA = [[1, 0.5], [2, 1.1], [3, 2.2], [4, 4], [5, 6.5], [6, 10], [7, 15], [8, 22.2], [9, 32], [10, 44.6], [11, 60.3], [12, 78.9], [13, 99.2], [14, 121.9], [15, 148.2], [16, 179.7], [17, 219], [18, 265.4], [19, 316.1], [20, 370.4], [21, 428.1], [22, 489.4], [23, 554.1], [24, 620.6], [25, 688.9], [26, 758.9], [27, 828.9], [28, 898.9], [29, 967.1], [30, 1033.6], [31, 1100.1], [32, 1164.8], [33, 1227.8], [34, 1290.8], [35, 1352.1], [36, 1411.6], [37, 1469.3], [38, 1525.3], [39, 1579.6], [40, 1632.1], [41, 1684.6], [42, 1735.3], [43, 1784.3], [44, 1833.3], [45, 1882.3], [46, 1931.3], [47, 1980.3]];
+/* peso -> semana equivalente na curva (interpolado) */
+function semanaParaPeso(pesoG) {
+  if (pesoG === null || pesoG === undefined || isNaN(pesoG) || pesoG <= 0) return null;
+  const c = CURVA_TILAPIA;
+  if (pesoG <= c[0][1]) return c[0][0];
+  for (let i = 1; i < c.length; i++) {
+    if (pesoG <= c[i][1]) return c[i - 1][0] + (pesoG - c[i - 1][1]) / (c[i][1] - c[i - 1][1]) * (c[i][0] - c[i - 1][0]);
+  }
+  return c[c.length - 1][0];
+}
+/* semana -> peso esperado (interpolado) */
+function pesoParaSemana(sem) {
+  if (sem === null || sem === undefined || isNaN(sem)) return null;
+  const c = CURVA_TILAPIA;
+  if (sem <= c[0][0]) return c[0][1];
+  for (let i = 1; i < c.length; i++) {
+    if (sem <= c[i][0]) return c[i - 1][1] + (sem - c[i - 1][0]) / (c[i][0] - c[i - 1][0]) * (c[i][1] - c[i - 1][1]);
+  }
+  return c[c.length - 1][1];
+}
+/* peso ideal de hoje: entra na curva pela gramatura de recepção e avança os dias decorridos */
+function pesoIdealHoje(pesoInicialG, dias) {
+  const entrada = semanaParaPeso(pesoInicialG);
+  if (entrada === null || dias === null || dias === undefined || isNaN(dias) || dias < 0) return null;
+  return pesoParaSemana(entrada + dias / 7);
+}
+
 /* temperatura média da leitura mais recente do tanque — só vale se for de hoje/ontem */
 function tempAtualTanque(s, tanqueId) {
   const p = s.parametros.filter(x => x.tanqueId === tanqueId).sort((a, b) => b.ts - a.ts)[0];
@@ -705,10 +849,53 @@ const PAPEIS = {
     admin: false
   }
 };
-const permDe = usuario => usuario ? PAPEIS[usuario.cargo] || PAPEIS["Operador"] : {
-  lanca: true,
-  edita: true,
-  admin: true
+/* padrão de módulos por cargo — o cargo é o atalho, os marcadores individuais afinam */
+const MODULOS_POR_CARGO = {
+  "Administrador master": {
+    parametros: true,
+    manejos: true,
+    estoque: true
+  },
+  "Gerente": {
+    parametros: true,
+    manejos: true,
+    estoque: true
+  },
+  "Operador": {
+    parametros: true,
+    manejos: true,
+    estoque: false
+  },
+  "Visualizador": {
+    parametros: false,
+    manejos: false,
+    estoque: false
+  }
+};
+const permDe = usuario => {
+  if (!usuario) return {
+    lanca: true,
+    edita: true,
+    admin: true,
+    parametros: true,
+    manejos: true,
+    estoque: true
+  };
+  const base = PAPEIS[usuario.cargo] || PAPEIS["Operador"];
+  const mods = MODULOS_POR_CARGO[usuario.cargo] || MODULOS_POR_CARGO["Operador"];
+  /* marcador individual (quando definido) manda mais que o padrão do cargo.
+     Aceita booleano ou o texto "Sim"/"Não" vindo do formulário. Vazio = segue o cargo. */
+  const escolhe = (v, padrao) => {
+    if (v === undefined || v === null || v === "") return padrao;
+    if (typeof v === "string") return v.trim().toLowerCase().charAt(0) === "s";
+    return !!v;
+  };
+  return {
+    ...base,
+    parametros: escolhe(usuario.podeParametros, mods.parametros),
+    manejos: escolhe(usuario.podeManejos, mods.manejos),
+    estoque: escolhe(usuario.podeEstoque, mods.estoque)
+  };
 };
 
 /* link de WhatsApp com mensagem pronta */
@@ -931,6 +1118,8 @@ const SEED = () => ({
   }],
   movsEstoque: [],
   equipamentos: [],
+  recados: [],
+  recadosLidos: [],
   tarefasTemplate: [{
     id: uid(),
     hora: "06:30",
@@ -1107,6 +1296,8 @@ function migrar(d) {
     if (!d.config.faixas[k]) d.config.faixas[k] = FAIXAS_DEFAULT[k];
   });
   if (!d.usuarios) d.usuarios = [];
+  if (!d.recados) d.recados = [];
+  if (!d.recadosLidos) d.recadosLidos = [];
   if (!d.patrocinios) d.patrocinios = [];
   if (d.usuarios.length === 0 && d.config.responsaveis?.length) d.usuarios = d.config.responsaveis.map((n, i) => ({
     id: uid(),
@@ -1387,6 +1578,9 @@ function calcLote(s, lote) {
     if (dd > 0) gpd = (ultimaBio.pesoMedioG - (lote.pesoInicialG || 0)) / dd;
   }
   const custosLote = s.custos.filter(c => c.loteId === lote.id).reduce((t, c) => t + (c.valor || 0), 0) + (lote.custoAlevinos || 0);
+  /* quanto do custo é ração — costuma ser 65-70% numa piscicultura */
+  const custoRacao = s.custos.filter(c => c.loteId === lote.id && c.categoria === "Ração").reduce((t, c) => t + (c.valor || 0), 0);
+  const pctRacao = custosLote > 0 ? custoRacao / custosLote * 100 : null;
   const receita = desps.reduce((t, d) => t + (d.biomassaKg || 0) * (d.precoKg || 0), 0);
   const dias = lote.dataPovoamento ? diasEntre(lote.dataPovoamento, hojeISO()) : 0;
   const tanque = tanqueDe(s, lote.tanqueId);
@@ -1403,6 +1597,17 @@ function calcLote(s, lote) {
   const sobrev = lote.nInicial > 0 ? vivos / lote.nInicial * 100 : null;
   const custoKg = biomassaKg > 0.5 ? custosLote / biomassaKg : null;
   const diasSemBio = ultimaBio ? diasEntre(ultimaBio.dataISO, hojeISO()) : lote.dataPovoamento ? diasEntre(lote.dataPovoamento, hojeISO()) : null;
+  /* biometria inteligente: peso ideal de hoje pela curva de referência */
+  const pesoIdeal = lote.pesoInicialG ? pesoIdealHoje(lote.pesoInicialG, dias) : null;
+  let diagBio = null;
+  if (pesoIdeal && pesoIdeal > 0 && pesoAtual > 0 && dias > 0) {
+    const desvioPct = (pesoAtual - pesoIdeal) / pesoIdeal * 100;
+    diagBio = {
+      pesoIdeal,
+      desvioPct,
+      status: desvioPct >= 10 ? "adiantado" : desvioPct <= -10 ? "atrasado" : "no ritmo"
+    };
+  }
   /* projeção de despesca: dias até o peso-alvo com o GPD atual */
   let projecao = null;
   if (lote.pesoAlvoG && pesoAtual > 0 && pesoAtual < lote.pesoAlvoG && gpd && gpd > 0.2) {
@@ -1442,6 +1647,10 @@ function calcLote(s, lote) {
     ajusteTemp,
     tratos,
     gran: rec.gran,
+    pesoIdeal,
+    diagBio,
+    custoRacao,
+    pctRacao,
     projecao
   };
 }
@@ -1453,24 +1662,48 @@ const checaFaixa = (faixa, v) => {
   if (faixa.max !== null && v > faixa.max) return "fora";
   return "ok";
 };
+/* nível do semáforo: "verde" (dentro da faixa), "amarelo" (fora, mas antes do crítico),
+   "vermelho" (passou do crítico) ou null quando não há medida. */
+const temNum = v => v !== null && v !== undefined && !isNaN(v);
+const nivelFaixa = (chave, faixa, v) => {
+  if (!temNum(v) || !faixa) return null;
+  const cr = FAIXAS_CRIT[chave] || {};
+  if (temNum(cr.critMin) && v < cr.critMin) return "vermelho";
+  if (temNum(cr.critMax) && v > cr.critMax) return "vermelho";
+  if (temNum(faixa.min) && v < faixa.min) return "amarelo";
+  if (temNum(faixa.max) && v > faixa.max) return "amarelo";
+  return "verde";
+};
+const corNivel = n => n === "vermelho" ? C.crit : n === "amarelo" ? C.warn : n === "verde" ? C.ok : C.muted;
+const bgNivel = n => n === "vermelho" ? C.critBg : n === "amarelo" ? C.warnBg : n === "verde" ? C.okBg : "transparent";
+const iconeNivel = n => n === "vermelho" ? "🔴" : n === "amarelo" ? "🟡" : n === "verde" ? "🟢" : "⚪";
+const textoNivel = n => n === "vermelho" ? "AGIR E CORRIGIR" : n === "amarelo" ? "ATENÇÃO — OBSERVAR" : n === "verde" ? "NORMAL" : "SEM MEDIDA";
 function alertasParametro(s, p) {
   const F = s.config.faixas;
   const out = [];
+  /* só entra na lista o que está fora do verde — amarelo (observar) ou vermelho (agir).
+     O conjunto é o mesmo de antes; a novidade é a gravidade e a ação sugerida. */
+  const add = (k, v, label) => {
+    if (!F[k]) return;
+    const nivel = nivelFaixa(k, F[k], v);
+    if (nivel !== "amarelo" && nivel !== "vermelho") return;
+    out.push({
+      k,
+      label,
+      faixa: F[k],
+      valor: v,
+      nivel,
+      acao: (FAIXAS_CRIT[k] || {}).acao || ""
+    });
+  };
   const t = [p.tempSup, p.tempMeio, p.tempFundo].filter(v => v !== null && v !== undefined);
   if (t.length) {
     const media = t.reduce((a, b) => a + b, 0) / t.length;
-    if (checaFaixa(F.temp, media) === "fora") out.push({
-      k: "temp",
-      label: `Temperatura ${fmtNum(media)}°C`,
-      faixa: F.temp
-    });
+    add("temp", media, `Temperatura ${fmtNum(media)}°C`);
   }
-  [["amonia"], ["nitrito"], ["alcalinidade"], ["ph"], ["od"], ["salinidade"], ["nitrato"], ["dureza"], ["solidos"]].forEach(([k]) => {
-    if (checaFaixa(F[k], p[k]) === "fora") out.push({
-      k,
-      label: `${F[k].label} ${fmtNum(p[k], k === "alcalinidade" ? 0 : 1)}${F[k].unit ? " " + F[k].unit : ""}`,
-      faixa: F[k]
-    });
+  ["amonia", "nitrito", "alcalinidade", "ph", "od", "salinidade", "nitrato", "dureza", "solidos"].forEach(k => {
+    if (!F[k]) return;
+    add(k, p[k], `${F[k].label} ${fmtNum(p[k], k === "alcalinidade" ? 0 : 1)}${F[k].unit ? " " + F[k].unit : ""}`);
   });
   return out;
 }
@@ -1486,10 +1719,10 @@ function alertasGerais(s) {
     const ps = s.parametros.filter(p => p.tanqueId === t.id).sort((a, b) => b.ts - a.ts);
     const p = ps[0];
     if (p) alertasParametro(s, p).forEach(a => out.push({
-      nivel: "crit",
+      nivel: a.nivel === "vermelho" ? "crit" : "warn",
       modulo: "params",
-      txt: `${t.id}: ${a.label} fora da faixa`,
-      det: `Ideal: ${a.faixa.min ?? "—"}–${a.faixa.max ?? "—"} ${a.faixa.unit}`
+      txt: `${iconeNivel(a.nivel)} ${t.id}: ${a.label} — ${textoNivel(a.nivel)}`,
+      det: a.acao || `Ideal: ${a.faixa.min ?? "—"}–${a.faixa.max ?? "—"} ${a.faixa.unit}`
     }));
   });
   lotesAtivos(s).forEach(l => {
@@ -2049,7 +2282,8 @@ const FormModal = ({
   salvarLabel = "Salvar",
   extra,
   valida,
-  onExcluir
+  onExcluir,
+  modulo
 }) => {
   const {
     s,
@@ -2090,9 +2324,16 @@ const FormModal = ({
         return;
       }
     }
-    onSalvar(out);
+    /* rede de proteção contra erro de digitação — vale para qualquer formulário */
+    const suspeitos = valoresSuspeitos(out);
+    if (suspeitos.length && !window.confirm(`Estes valores parecem erro de digitação:\n\n${suspeitos.join("\n")}\n\nEsses números alimentam a sugestão de ração e a biometria — um dígito errado atrapalha tudo.\n\nSalvar assim mesmo?`)) return;
+    /* carimbo automático de autoria: quem lançou (usuário logado) e quando */
+    onSalvar({
+      ...out,
+      ...autoria()
+    });
   };
-  if (perm && !perm.lanca) return /*#__PURE__*/React.createElement("div", {
+  if (perm && (!perm.lanca || modulo && perm[modulo] === false)) return /*#__PURE__*/React.createElement("div", {
     style: {
       position: "fixed",
       inset: 0,
@@ -3125,7 +3366,7 @@ const TanquesScreen = ({
     valor: fmtInt(k.vivos),
     sub: `sobrevive ${fmtNum(k.sobrev, 1)}%`
   })), /*#__PURE__*/React.createElement(KV, {
-    linhas: [["Espécie / origem", `${lote.especie}${lote.origem ? " · " + lote.origem : ""}`], ["Povoado em", `${fmtData(lote.dataPovoamento)} (${k.dias} dias)`], ["Estocagem inicial", `${fmtInt(lote.nInicial)} un · ${fmtNum(lote.pesoInicialG, 1)} g`], ["Peso médio atual", `${fmtNum(k.pesoAtual, 0)} g${k.gpd ? ` · GPD ${fmtNum(k.gpd, 1)} g/dia` : ""}`], ["Ração acumulada", `${fmtNum(k.racaoKg, 1)} kg${k.fca ? ` · FCA ${fmtNum(k.fca, 2)}` : ""}`], ["Ração recomendada", `${k.gran} · ${fmtNum(k.taxa, 1)}% · ${k.tratos} tratos/dia`, C.ouroClaro], ["Sugestão de trato", `${fmtNum(k.racaoDiaKg, 1)} kg/dia ÷ ${k.tratos} = ${fmtNum(k.racaoTratoKg, 1)} kg/trato`, C.ouroClaro], ["Custo acumulado", `${fmtR$(k.custosLote)}${k.custoKg ? ` · ${fmtR$(k.custoKg)}/kg` : ""}`], ...(lote.dataDespescaPrevista || lote.pesoAlvoG ? [["Plano de despesca", `${lote.pesoAlvoG ? fmtNum(lote.pesoAlvoG, 0) + " g" : "—"} até ${fmtData(lote.dataDespescaPrevista)}`]] : []), ...(k.projecao ? [["Projeção (GPD atual)", `${fmtData(k.projecao.dataProj)} (${k.projecao.diasFaltam} dias)`, k.projecao.atrasado ? C.warn : C.ok]] : [])]
+    linhas: [["Espécie / origem", `${lote.especie}${lote.origem ? " · " + lote.origem : ""}`], ["Povoado em", `${fmtData(lote.dataPovoamento)} (${k.dias} dias)`], ["Estocagem inicial", `${fmtInt(lote.nInicial)} un · ${fmtNum(lote.pesoInicialG, 1)} g`], ["Peso médio atual", `${fmtNum(k.pesoAtual, 0)} g${k.gpd ? ` · GPD ${fmtNum(k.gpd, 1)} g/dia` : ""}`], ...(k.diagBio ? [["Peso ideal hoje (curva)", `${fmtNum(k.diagBio.pesoIdeal, 0)} g · ${k.diagBio.status} (${k.diagBio.desvioPct > 0 ? "+" : ""}${fmtNum(k.diagBio.desvioPct, 0)}%)`, k.diagBio.status === "atrasado" ? C.warn : k.diagBio.status === "adiantado" ? C.ouroClaro : C.ok]] : []), ["Ração acumulada", `${fmtNum(k.racaoKg, 1)} kg${k.fca ? ` · FCA ${fmtNum(k.fca, 2)}` : ""}`], ["Ração recomendada", `${k.gran} · ${fmtNum(k.taxa, 1)}% · ${k.tratos} tratos/dia`, C.ouroClaro], ["Sugestão de trato", `${fmtNum(k.racaoDiaKg, 1)} kg/dia ÷ ${k.tratos} = ${fmtNum(k.racaoTratoKg, 1)} kg/trato`, C.ouroClaro], ["Custo acumulado", `${fmtR$(k.custosLote)}${k.pctRacao !== null && k.pctRacao > 0 ? ` · ração ${fmtNum(k.pctRacao, 0)}% (${fmtR$(k.custoRacao)})` : ""}`], ["Custo por kg produzido", k.custoKg ? `${fmtR$(k.custoKg)}/kg` : "—", C.ouroClaro], ...(k.fca ? [["FCA real × meta", `${fmtNum(k.fca, 2)} contra meta ${fmtNum(s.config.metaFCA || 1.8, 1)}${k.fca <= (s.config.metaFCA || 1.8) ? " — dentro" : " — acima, cada ponto vira custo"}`, k.fca <= (s.config.metaFCA || 1.8) ? C.ok : C.warn]] : []), ...(lote.dataDespescaPrevista || lote.pesoAlvoG ? [["Plano de despesca", `${lote.pesoAlvoG ? fmtNum(lote.pesoAlvoG, 0) + " g" : "—"} até ${fmtData(lote.dataDespescaPrevista)}`]] : []), ...(k.projecao ? [["Projeção (GPD atual)", `${fmtData(k.projecao.dataProj)} (${k.projecao.diasFaltam} dias)`, k.projecao.atrasado ? C.warn : C.ok]] : [])]
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
@@ -3568,7 +3809,7 @@ const ParamsScreen = ({
       fontSize: 12,
       color: C.muted
     }
-  }, "Última medição · ", fmtData(ult.dataISO), " ", ult.hora || "", ult.resp ? ` · ${ult.resp}` : ""), /*#__PURE__*/React.createElement("div", {
+  }, "Última medição · ", fmtData(ult.dataISO), " ", ult.hora || "", autorDe(ult) ? ` · por ${autorDe(ult)}` : "", quandoDe(ult) ? ` (${quandoDe(ult)})` : ""), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6,
@@ -3576,9 +3817,9 @@ const ParamsScreen = ({
     }
   }, ultAlertas.length === 0 ? /*#__PURE__*/React.createElement(Chip, {
     nivel: "ok"
-  }, "dentro das faixas") : /*#__PURE__*/React.createElement(Chip, {
-    nivel: "crit"
-  }, ultAlertas.length, " fora"), /*#__PURE__*/React.createElement(BtnDel, {
+  }, "tudo normal") : /*#__PURE__*/React.createElement(Chip, {
+    nivel: ultAlertas.some(a => a.nivel === "vermelho") ? "crit" : "warn"
+  }, ultAlertas.some(a => a.nivel === "vermelho") ? `${ultAlertas.filter(a => a.nivel === "vermelho").length} crítico(s)` : `${ultAlertas.length} em atenção`), /*#__PURE__*/React.createElement(BtnDel, {
     onDel: () => up(d => {
       delReg(d, "parametros", ult.id);
     })
@@ -3601,23 +3842,43 @@ const ParamsScreen = ({
     }
   }, "Obs.: ", ult.obs), ultAlertas.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
-      background: C.critBg,
+      marginTop: 10
+    }
+  }, ultAlertas.slice().sort((a, b) => (a.nivel === "vermelho" ? 0 : 1) - (b.nivel === "vermelho" ? 0 : 1)).map(a => /*#__PURE__*/React.createElement("div", {
+    key: a.k,
+    style: {
+      background: bgNivel(a.nivel),
+      border: `1px solid ${corNivel(a.nivel)}`,
       borderRadius: 10,
       padding: 10,
-      marginTop: 10
+      marginBottom: 6
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
       fontWeight: 700,
-      color: C.crit,
+      color: corNivel(a.nivel),
       marginBottom: 3
     }
-  }, "⚠ Fora da faixa: ", ultAlertas.map(a => a.label).join(" · ")), /*#__PURE__*/React.createElement("div", {
+  }, iconeNivel(a.nivel), " ", a.label, " · ", textoNivel(a.nivel)), a.acao && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.ink,
+      lineHeight: 1.5
+    }
+  }, /*#__PURE__*/React.createElement("b", null, "O que fazer: "), a.acao))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.muted,
+      lineHeight: 1.5,
+      marginTop: 2
+    }
+  }, AVISO_SUGESTAO), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: C.ink2,
-      lineHeight: 1.5
+      lineHeight: 1.5,
+      marginTop: 6
     }
   }, "Registre a orientação do seu engenheiro no módulo ", /*#__PURE__*/React.createElement("b", null, "Correções"), " — a dosagem aplicada baixa o estoque e cria lembrete de re-medição em 48h."))) : /*#__PURE__*/React.createElement("div", {
     style: {
@@ -3665,6 +3926,7 @@ const ParamsScreen = ({
     }, "NH₃ ", fmtNum(p.amonia), " · NO₂ ", fmtNum(p.nitrito), " · alc ", fmtNum(p.alcalinidade, 0), " · pH ", fmtNum(p.ph), " · OD ", fmtNum(p.od)));
   })), modal && /*#__PURE__*/React.createElement(FormModal, {
     titulo: `Medição — ${sel}`,
+    modulo: "parametros",
     onFechar: () => setModal(false),
     campos: [{
       k: "dataISO",
@@ -3737,11 +3999,6 @@ const ParamsScreen = ({
       type: "number",
       unit: "mL/L",
       dica: "Leitura após 15-20 min de decantação"
-    }, {
-      k: "resp",
-      label: "Responsável",
-      type: "select",
-      options: st => st.config.responsaveis
     }, {
       k: "obs",
       label: "Observações",
@@ -3844,7 +4101,7 @@ const FeedScreen = ({
       fontSize: 11,
       color: C.muted
     }
-  }, a.resp || ""), /*#__PURE__*/React.createElement(BtnDel, {
+  }, autorDe(a)), /*#__PURE__*/React.createElement(BtnDel, {
     onDel: () => up(d => {
       const it = d.estoque.find(i => i.id === a.racaoItemId);
       if (it && d.movsEstoque.some(m => m.refId === a.id)) it.qtd += a.kg || 0;
@@ -3859,6 +4116,7 @@ const FeedScreen = ({
     }
   }, a.racaoNome || "ração não informada"))))), modal && lote && /*#__PURE__*/React.createElement(FormModal, {
     titulo: `Trato — ${sel}`,
+    modulo: "manejos",
     onFechar: () => setModal(false),
     campos: [{
       k: "dataISO",
@@ -3886,11 +4144,6 @@ const FeedScreen = ({
         v: r.id,
         t: `${r.nome} (${fmtNum(r.qtd, 0)} ${r.unidade})`
       }))
-    }, {
-      k: "resp",
-      label: "Responsável",
-      type: "select",
-      options: st => st.config.responsaveis
     }, {
       k: "obs",
       label: "Observação",
@@ -4064,6 +4317,7 @@ const BioScreen = ({
     }
   }, "min ", fmtNum(b.pesoMinG, 0), "g · máx ", fmtNum(b.pesoMaxG, 0), "g · amplitude ", b.pesoMaxG && b.pesoMinG ? fmtNum(b.pesoMaxG - b.pesoMinG, 0) : "—", "g"))))), modal && lote && /*#__PURE__*/React.createElement(FormModal, {
     titulo: `Biometria — ${sel}`,
+    modulo: "manejos",
     onFechar: () => setModal(false),
     campos: [{
       k: "dataISO",
@@ -4184,7 +4438,7 @@ const CorrScreen = ({
       color: C.ink2,
       marginTop: 2
     }
-  }, c.dosagem ? `${fmtNum(c.dosagem, 1)} ${c.unidade || "g"}/m³ × ${tq?.vol || "?"} m³ = ` : "", /*#__PURE__*/React.createElement("b", null, c.totalAplicado ? `${fmtNum(c.totalAplicado, 0)} ${c.unidade || "g"}` : "—"), c.resp ? ` · ${c.resp}` : ""), c.obs && /*#__PURE__*/React.createElement("div", {
+  }, c.dosagem ? `${fmtNum(c.dosagem, 1)} ${c.unidade || "g"}/m³ × ${tq?.vol || "?"} m³ = ` : "", /*#__PURE__*/React.createElement("b", null, c.totalAplicado ? `${fmtNum(c.totalAplicado, 0)} ${c.unidade || "g"}` : "—"), autorDe(c) ? ` · por ${autorDe(c)}` : ""), c.obs && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: C.muted,
@@ -4224,20 +4478,37 @@ const CorrScreen = ({
       type: "number",
       dica: `Se vazio, calculo dosagem × ${tq?.vol || "?"} m³`
     }, {
-      k: "resp",
-      label: "Responsável",
-      type: "select",
-      options: st => st.config.responsaveis
-    }, {
       k: "obs",
       label: "Orientação / observação",
       type: "textarea",
       largo: true,
       ph: "ex.: ordem do Dr. Pedro — nitrito alto"
+    }, {
+      k: "paraEquipe",
+      label: "Avisar a equipe?",
+      type: "select",
+      options: ["Sim", "Não"],
+      dica: "Publica esta orientação no mural de Recados, para toda a equipe ver"
     }],
     onSalvar: v => {
       const total = v.totalAplicado ?? (v.dosagem && tq?.vol ? v.dosagem * tq.vol : null);
       up(d => {
+        /* orientação do responsável técnico vira recado para toda a equipe */
+        if (v.paraEquipe === "Sim" && (v.obs || v.tipo)) {
+          if (!d.recados) d.recados = [];
+          d.recados.push({
+            id: uid(),
+            um: Date.now(),
+            ts: Date.now(),
+            dataISO: v.dataISO || hojeISO(),
+            tipo: "Orientação técnica",
+            tanqueId: sel,
+            texto: `${v.tipo || "Correção"} em ${sel}${total ? ` — aplicar ${fmtNum(total, 0)}` : ""}${v.obs ? `\n\n${v.obs}` : ""}`,
+            porEmail: v.porEmail || null,
+            porQuando: v.porQuando || new Date().toISOString(),
+            fixado: "Sim"
+          });
+        }
         const item = d.estoque.find(i => i.id === v.produtoItemId);
         const unidade = item ? item.unidade : "g";
         const cId = uid();
@@ -4355,14 +4626,15 @@ const MortScreen = ({
     onDel: () => up(d => {
       delReg(d, "mortalidades", m.id);
     })
-  }))), (m.acao || m.resp) && /*#__PURE__*/React.createElement("div", {
+  }))), (m.acao || autorDe(m)) && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: C.muted,
       marginTop: 2
     }
-  }, m.acao, m.resp ? ` · ${m.resp}` : ""))))), modal && lote && /*#__PURE__*/React.createElement(FormModal, {
+  }, m.acao, autorDe(m) ? ` · por ${autorDe(m)}` : ""))))), modal && lote && /*#__PURE__*/React.createElement(FormModal, {
     titulo: `Mortalidade — ${sel}`,
+    modulo: "manejos",
     onFechar: () => setModal(false),
     campos: [{
       k: "dataISO",
@@ -4390,11 +4662,6 @@ const MortScreen = ({
       k: "acao",
       label: "Ação tomada",
       ph: "ex.: aumentou aeração"
-    }, {
-      k: "resp",
-      label: "Responsável",
-      type: "select",
-      options: st => st.config.responsaveis
     }, {
       k: "obs",
       label: "Observações",
@@ -4554,6 +4821,7 @@ const StockScreen = ({
     }
   }, "“≈Nd” = dias restantes pela média de consumo dos últimos 7 dias. Toque num item pra editar."), modal?.tipo === "entrada" && /*#__PURE__*/React.createElement(FormModal, {
     titulo: "Entrada de material",
+    modulo: "estoque",
     onFechar: () => setModal(null),
     campos: [{
       k: "itemId",
@@ -4930,7 +5198,7 @@ const ManejoScreen = ({
       fontSize: 10,
       color: C.muted
     }
-  }, "· ", t.hora, t.resp ? ` · ${t.resp}` : ""))))), /*#__PURE__*/React.createElement("div", {
+  }, "· ", t.hora, autorDe(t) ? ` · por ${autorDe(t)}` : ""))))), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 10
     }
@@ -4950,11 +5218,6 @@ const ManejoScreen = ({
       label: "Hora",
       type: "time",
       def: agoraHM
-    }, {
-      k: "resp",
-      label: "Responsável",
-      type: "select",
-      options: st => st.config.responsaveis
     }],
     onSalvar: v => {
       up(d => {
@@ -5657,7 +5920,7 @@ const EquipScreen = ({
         fontSize: 11,
         color: C.muted
       }
-    }, [eq.tanqueId ? `tanque ${eq.tanqueId}` : eq.local, eq.potenciaKW ? `${fmtNum(eq.potenciaKW, 1)} kW × ${fmtNum(eq.horasDia || 0, 0)}h/dia` : null, `${fmtInt(eq.horimetro || 0)}h`].filter(Boolean).join(" · ")), eq.garantiaAte && /*#__PURE__*/React.createElement("div", {
+    }, [eq.tanqueId ? `tanque ${eq.tanqueId}` : eq.local, eq.potenciaKW ? `${fmtNum(eq.potenciaKW, 1)} kW × ${fmtNum(eq.horasDia || 0, 0)}h/dia` : null, `${fmtInt(eq.horimetro || 0)}h`, eq.serie ? `série ${eq.serie}` : null].filter(Boolean).join(" · ")), eq.garantiaAte && /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 10,
         color: eq.garantiaAte < hojeISO() ? C.muted : diasEntre(hojeISO(), eq.garantiaAte) <= 30 ? C.warn : C.ok
@@ -5740,8 +6003,18 @@ const EquipScreen = ({
       type: "date",
       dica: "O assistente avisa 30 dias antes de vencer"
     }, {
+      k: "serie",
+      label: "Número de série",
+      largo: true,
+      dica: "O que a assistência técnica pede primeiro — e o que prova que o equipamento é seu"
+    }, {
+      k: "notaFiscal",
+      label: "Nota fiscal / fornecedor",
+      largo: true,
+      dica: "Nº da nota e de quem comprou — vale pra garantia e pro seguro"
+    }, {
       k: "obs",
-      label: "Observações / nº de série",
+      label: "Observações",
       largo: true
     }],
     onExcluir: modal.tipo === "editarEq" ? () => up(d => {
@@ -8929,6 +9202,11 @@ const MODULOS = [{
   grupo: "Operação diária",
   icone: IC.frasco
 }, {
+  id: "mural",
+  label: "Recados da equipe",
+  grupo: "Operação diária",
+  icone: IC.lista
+}, {
   id: "mort",
   label: "Mortalidade",
   grupo: "Operação diária",
@@ -9536,7 +9814,11 @@ const ConfigScreen = () => {
       fontSize: 10,
       color: C.muted
     }
-  }, PAPEIS[u.cargo]?.admin ? "gerencia tudo" : PAPEIS[u.cargo]?.edita ? "lança + edita" : PAPEIS[u.cargo]?.lanca ? "só lança" : "só consulta"))), !perm.admin && /*#__PURE__*/React.createElement("div", {
+  }, PAPEIS[u.cargo]?.admin ? "gerencia tudo" : PAPEIS[u.cargo]?.edita ? "lança + edita" : PAPEIS[u.cargo]?.lanca ? "só lança" : "só consulta", (() => {
+    const pu = permDe(u);
+    const mods = [pu.parametros ? "parâmetros" : null, pu.manejos ? "manejos" : null, pu.estoque ? "estoque" : null].filter(Boolean);
+    return mods.length ? ` · ${mods.join(", ")}` : " · sem lançamentos";
+  })()))), !perm.admin && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10.5,
       color: C.muted
@@ -9645,7 +9927,25 @@ const ConfigScreen = () => {
       type: "select",
       req: true,
       options: CARGOS,
-      dica: "Define o que a pessoa pode fazer no app"
+      dica: "Atalho: já define um padrão de permissões"
+    }, {
+      k: "podeParametros",
+      label: "Pode lançar Parâmetros",
+      type: "select",
+      options: ["Sim", "Não"],
+      dica: "Água: oxigênio, pH, temperatura, amônia… Deixe vazio para seguir o padrão do cargo"
+    }, {
+      k: "podeManejos",
+      label: "Pode lançar Manejos",
+      type: "select",
+      options: ["Sim", "Não"],
+      dica: "Arraçoamento, biometria, mortalidade e correções"
+    }, {
+      k: "podeEstoque",
+      label: "Pode lançar Estoque",
+      type: "select",
+      options: ["Sim", "Não"],
+      dica: "Entrada e recepção de insumos"
     }, {
       k: "pin",
       label: "PIN de entrada (opcional)",
@@ -10321,6 +10621,147 @@ function demoData() {
   return d;
 }
 
+/* ================= Mural — recados e orientações da equipe ================= */
+const MuralScreen = () => {
+  const {
+    s,
+    up
+  } = useApp();
+  const [modal, setModal] = useState(false);
+  const eu = window.__aluviAuth && window.__aluviAuth.email ? window.__aluviAuth.email() : null;
+  /* fixados primeiro, depois os mais recentes */
+  const lista = (s.recados || []).slice().sort((a, b) => (b.fixado === "Sim" ? 1 : 0) - (a.fixado === "Sim" ? 1 : 0) || (b.ts || 0) - (a.ts || 0));
+  /* Cada leitura é um REGISTRO PRÓPRIO, não um campo dentro do recado.
+     Motivo: a nuvem resolve conflito por "quem gravou por último vence". Se a
+     confirmação de leitura ficasse dentro do recado, o "Li" de um funcionário
+     apagaria o do outro. Como registro separado, todas se somam na sincronização. */
+  const lidosDe = id => (s.recadosLidos || []).filter(x => x.recadoId === id);
+  const marcarLido = r => up(d => {
+    const quem = eu || "equipe";
+    if (!d.recadosLidos) d.recadosLidos = [];
+    if (d.recadosLidos.some(x => x.recadoId === r.id && x.porEmail === quem)) return;
+    d.recadosLidos.push({
+      id: uid(),
+      um: Date.now(),
+      ts: Date.now(),
+      recadoId: r.id,
+      porEmail: quem,
+      quandoISO: new Date().toISOString()
+    });
+  });
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(H2, null, "Recados da equipe"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.muted,
+      marginBottom: 10,
+      lineHeight: 1.5
+    }
+  }, "Espaço de comunicação da piscicultura. O engenheiro responsável deixa orientações aqui e toda a equipe vê — inclusive quem está sem sinal no campo, que recebe assim que sincronizar."), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => setModal(true)
+  }, "+ Novo recado"), lista.length === 0 ? /*#__PURE__*/React.createElement(Vazio, null, "Nenhum recado ainda.", /*#__PURE__*/React.createElement("br", null), "Use este espaço pra alinhar a equipe.") : lista.map(r => {
+    const orient = r.tipo === "Orientação técnica";
+    const lidos = lidosDe(r.id);
+    const jaLi = lidos.some(x => x.porEmail === (eu || "equipe"));
+    return /*#__PURE__*/React.createElement(Card, {
+      key: r.id,
+      style: {
+        marginBottom: 8,
+        borderLeft: `3px solid ${orient ? C.ouro : C.line2}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        marginBottom: 4
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11,
+        fontWeight: 700,
+        letterSpacing: 0.4,
+        color: orient ? C.ouroClaro : C.ink2
+      }
+    }, r.fixado === "Sim" ? "📌 " : "", orient ? "ORIENTAÇÃO TÉCNICA" : "RECADO"), /*#__PURE__*/React.createElement(BtnDel, {
+      onDel: () => up(d => {
+        (d.recadosLidos || []).filter(x => x.recadoId === r.id).forEach(x => delReg(d, "recadosLidos", x.id));
+        delReg(d, "recados", r.id);
+      })
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: C.ink,
+        lineHeight: 1.5,
+        whiteSpace: "pre-wrap"
+      }
+    }, r.texto), r.tanqueId ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: C.ouroClaro,
+        marginTop: 4
+      }
+    }, "Tanque: ", r.tanqueId) : null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.muted,
+        marginTop: 6
+      }
+    }, autorDe(r) || "—", quandoDe(r) ? ` · ${quandoDe(r)}` : "", lidos.length ? ` · lido por ${lidos.length}` : ""), jaLi ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.ok,
+        marginTop: 6
+      }
+    }, "✓ você já leu") : /*#__PURE__*/React.createElement(Btn, {
+      pequeno: true,
+      tipo: "escuro",
+      style: {
+        marginTop: 8
+      },
+      onClick: () => marcarLido(r)
+    }, "✓ Li este recado"));
+  }), modal && /*#__PURE__*/React.createElement(FormModal, {
+    titulo: "Novo recado",
+    onFechar: () => setModal(false),
+    campos: [{
+      k: "tipo",
+      label: "Tipo",
+      type: "select",
+      req: true,
+      options: ["Recado", "Orientação técnica"],
+      dica: "Orientação técnica fica destacada em dourado — use para instrução do engenheiro"
+    }, {
+      k: "texto",
+      label: "Mensagem",
+      type: "textarea",
+      req: true,
+      largo: true
+    }, {
+      k: "tanqueId",
+      label: "Tanque (opcional)",
+      type: "select",
+      options: st => st.tanques.filter(t => t.ativo).map(t => t.id)
+    }, {
+      k: "fixado",
+      label: "Fixar no topo",
+      type: "select",
+      options: ["Sim", "Não"]
+    }],
+    onSalvar: v => {
+      up(d => {
+        d.recados.push({
+          id: uid(),
+          um: Date.now(),
+          ts: Date.now(),
+          dataISO: hojeISO(),
+          ...v
+        });
+      });
+      setModal(false);
+    }
+  }));
+};
+
 /* ================= App root ================= */
 const TELAS = {
   home: Home,
@@ -10330,6 +10771,7 @@ const TELAS = {
   feed: FeedScreen,
   bio: BioScreen,
   corr: CorrScreen,
+  mural: MuralScreen,
   mort: MortScreen,
   manejo: ManejoScreen,
   tanques: TanquesScreen,
