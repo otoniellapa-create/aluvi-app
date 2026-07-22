@@ -1497,11 +1497,12 @@ function analisarFazenda(s) {
   });
   /* exclusões recentes — o administrador master precisa ficar sabendo */
   const exclRecentes = (s.exclusoes || []).filter(x => x.porQuando && Date.now() - new Date(x.porQuando).getTime() < 2 * 86400000);
-  if (exclRecentes.length) out.push({
+  if (exclRecentes.length) itens.push({
     nivel: "warn",
     modulo: "config",
-    txt: `${exclRecentes.length} registro(s) apagado(s) nas últimas 48h`,
-    det: `${exclRecentes.slice(0, 3).map(x => `${x.descricao} (por ${autorDe(x) || "—"})`).join(" · ")} — histórico completo em Config & Backup`
+    titulo: `${exclRecentes.length} registro(s) apagado(s) nas últimas 48h`,
+    detalhe: exclRecentes.slice(0, 3).map(x => `${x.descricao} (por ${autorDe(x) || "—"})`).join(" · "),
+    acao: "Confira o histórico completo em Config & Backup — o registro guarda quem apagou, o quê e quando."
   });
   /* licenças e certificações vencendo — renovação costuma demorar, avisa com 60 dias */
   (s.certificacoes || []).forEach(c => {
