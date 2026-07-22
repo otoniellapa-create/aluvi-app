@@ -630,6 +630,58 @@ const TABELA_ARR = [{
 }];
 const recomendacaoArr = pesoG => TABELA_ARR.find(f => (pesoG || 0) <= f.ate) || TABELA_ARR[TABELA_ARR.length - 1];
 
+/* ===== Arraçoamento inteligente · ajuste pela temperatura da água =====
+   A tabela por peso dá a taxa base (água em faixa ideal). A temperatura muda o
+   metabolismo da tilápia: no frio ela come menos — ração sobrando é desperdício
+   e ainda piora a qualidade da água; no calor forte também se reduz.
+   Conferido contra o programa de arraçoamento por temperatura:
+   peixe de 30 g a 25 °C -> 6% x 0,80 = 4,8% | a 28 °C -> 6% x 1,00 = 6,0%.
+   Faixas a revisar com o engenheiro responsável. */
+const FATOR_TEMP = [{
+  ate: 20,
+  fator: 0,
+  nota: "abaixo de 20 °C — suspender a ração"
+}, {
+  ate: 22,
+  fator: 0.4,
+  nota: "frio — reduzir bastante"
+}, {
+  ate: 24,
+  fator: 0.6,
+  nota: "frio — reduzir"
+}, {
+  ate: 26,
+  fator: 0.8,
+  nota: "abaixo do ideal — reduzir um pouco"
+}, {
+  ate: 30,
+  fator: 1,
+  nota: "faixa ideal"
+}, {
+  ate: 32,
+  fator: 0.8,
+  nota: "calor — reduzir"
+}, {
+  ate: 1e9,
+  fator: 0.5,
+  nota: "calor forte — reduzir muito"
+}];
+const fatorTemp = tC => tC === null || tC === undefined || isNaN(tC) ? null : FATOR_TEMP.find(f => tC < f.ate) || FATOR_TEMP[FATOR_TEMP.length - 1];
+/* temperatura média da leitura mais recente do tanque — só vale se for de hoje/ontem */
+function tempAtualTanque(s, tanqueId) {
+  const p = s.parametros.filter(x => x.tanqueId === tanqueId).sort((a, b) => b.ts - a.ts)[0];
+  if (!p) return null;
+  const vs = [p.tempSup, p.tempMeio, p.tempFundo].filter(v => v !== null && v !== undefined && !isNaN(v));
+  if (!vs.length) return null;
+  const dias = p.dataISO ? diasEntre(p.dataISO, hojeISO()) : 99;
+  if (dias > 2) return null;
+  return {
+    media: vs.reduce((a, b) => a + b, 0) / vs.length,
+    dataISO: p.dataISO,
+    dias
+  };
+}
+
 /* papéis e permissões */
 const PAPEIS = {
   "Administrador master": {
@@ -1340,8 +1392,13 @@ function calcLote(s, lote) {
   const tanque = tanqueDe(s, lote.tanqueId);
   const densidade = tanque && tanque.vol ? biomassaKg / tanque.vol : null;
   const rec = recomendacaoArr(pesoAtual);
-  const taxa = num(lote.taxaOverride) || rec.taxa;
+  const taxaBase = num(lote.taxaOverride) || rec.taxa;
   const tratos = num(lote.tratosOverride) || rec.tratos;
+  /* ajuste pela temperatura da água — não se aplica quando a taxa foi fixada à mão */
+  const tempAgua = tempAtualTanque(s, lote.tanqueId);
+  const ftemp = tempAgua ? fatorTemp(tempAgua.media) : null;
+  const ajusteTemp = ftemp && !lote.taxaOverride ? ftemp : null;
+  const taxa = ajusteTemp ? taxaBase * ajusteTemp.fator : taxaBase;
   const racaoDiaKg = biomassaKg * taxa / 100;
   const sobrev = lote.nInicial > 0 ? vivos / lote.nInicial * 100 : null;
   const custoKg = biomassaKg > 0.5 ? custosLote / biomassaKg : null;
@@ -1380,6 +1437,9 @@ function calcLote(s, lote) {
     racaoKg,
     ganhoKg,
     taxa,
+    taxaBase,
+    tempAgua,
+    ajusteTemp,
     tratos,
     gran: rec.gran,
     projecao
@@ -3336,7 +3396,7 @@ const TanquesScreen = ({
       label: "Fase",
       type: "select",
       req: true,
-      options: ["Berçário", "Engorda"]
+      options: ["Berçário", "Engorda", "Pulmão", "Decantação"]
     }, {
       k: "capacidadeAlevinos",
       label: "Capacidade",
@@ -3394,7 +3454,7 @@ const TanquesScreen = ({
       label: "Fase",
       type: "select",
       req: true,
-      options: ["Berçário", "Engorda"]
+      options: ["Berçário", "Engorda", "Pulmão", "Decantação"]
     }, {
       k: "capacidadeAlevinos",
       label: "Capacidade",
@@ -3746,14 +3806,14 @@ const FeedScreen = ({
       marginBottom: 6
     }
   }, "PROGRAMAÇÃO DO DIA · ", sel), /*#__PURE__*/React.createElement(KV, {
-    linhas: [["Biomassa estimada", `${fmtNum(k.biomassaKg, 0)} kg · peixe ${fmtNum(k.pesoAtual, 0)} g`], ["Granulometria indicada", k.gran, C.ouroClaro], ["Taxa aplicada", `${fmtNum(k.taxa, 1)}% da biomassa${lote.taxaOverride ? " (fixada)" : " (tabela)"}`], ["Ração do dia", `${fmtNum(k.racaoDiaKg, 1)} kg`, C.ouroClaro], [`Por trato (${k.tratos}x)`, `${fmtNum(k.racaoTratoKg, 1)} kg`, C.ouroClaro], ["Lançado hoje", `${fmtNum(totalDia, 1)} kg (${doDia.length} trato${doDia.length === 1 ? "" : "s"})`, totalDia >= k.racaoDiaKg * 0.95 ? C.ok : C.ink]]
+    linhas: [["Biomassa estimada", `${fmtNum(k.biomassaKg, 0)} kg · peixe ${fmtNum(k.pesoAtual, 0)} g`], ["Granulometria indicada", k.gran, C.ouroClaro], ["Temperatura da água", k.tempAgua ? `${fmtNum(k.tempAgua.media, 1)} °C · ${k.ajusteTemp ? k.ajusteTemp.nota : "taxa fixada à mão"}` : "sem leitura recente — lance em Parâmetros", k.ajusteTemp ? k.ajusteTemp.fator === 1 ? C.ok : C.warn : C.muted], ["Taxa aplicada", k.ajusteTemp ? `${fmtNum(k.taxa, 1)}% da biomassa (${fmtNum(k.taxaBase, 1)}% × ${fmtNum(k.ajusteTemp.fator, 2)} pela temperatura)` : `${fmtNum(k.taxa, 1)}% da biomassa${lote.taxaOverride ? " (fixada)" : " (tabela)"}`], ["Ração do dia", k.ajusteTemp && k.ajusteTemp.fator === 0 ? "suspender hoje (água fria)" : `${fmtNum(k.racaoDiaKg, 1)} kg`, k.ajusteTemp && k.ajusteTemp.fator === 0 ? C.warn : C.ouroClaro], [`Por trato (${k.tratos}x)`, `${fmtNum(k.racaoTratoKg, 1)} kg`, C.ouroClaro], ["Lançado hoje", `${fmtNum(totalDia, 1)} kg (${doDia.length} trato${doDia.length === 1 ? "" : "s"})`, totalDia >= k.racaoDiaKg * 0.95 ? C.ok : C.ink]]
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       color: C.muted,
       marginTop: 6
     }
-  }, "Granulometria, taxa e tratos vêm da tabela técnica pelo peso da última biometria — confirme com seu engenheiro. Pra fixar valores: Tanques & Lotes → Editar lote.")), /*#__PURE__*/React.createElement(Btn, {
+  }, "Granulometria, taxa e tratos vêm da tabela técnica pelo peso da última biometria, e a taxa é ajustada pela temperatura da água do dia (módulo Parâmetros). É sugestão — a decisão é sua, confirme com seu engenheiro. Pra fixar valores: Tanques & Lotes → Editar lote.")), /*#__PURE__*/React.createElement(Btn, {
     onClick: () => setModal(true)
   }, "+ Registrar trato"), doDia.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(H2, null, "Tratos de hoje"), doDia.map(a => /*#__PURE__*/React.createElement(Card, {
     key: a.id,
@@ -8073,7 +8133,7 @@ const OnboardingWizard = ({
   });
   const TOTAL = 5;
   const proxCodigo = fase => {
-    const pref = fase === "Berçário" ? "B" : "E";
+    const pref = { "Berçário": "B", "Engorda": "E", "Pulmão": "P", "Decantação": "D" }[fase] || "T";
     let n = 1;
     while (dados.tanques.some(t => t.id === `${pref}${n}`)) n++;
     return `${pref}${n}`;
@@ -8526,7 +8586,7 @@ const OnboardingWizard = ({
       ...tq,
       fase: e.target.value
     })
-  }, /*#__PURE__*/React.createElement("option", null, "Berçário"), /*#__PURE__*/React.createElement("option", null, "Engorda"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+  }, /*#__PURE__*/React.createElement("option", null, "Berçário"), /*#__PURE__*/React.createElement("option", null, "Engorda"), /*#__PURE__*/React.createElement("option", null, "Pulmão"), /*#__PURE__*/React.createElement("option", null, "Decantação"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     style: {
       fontSize: 10,
       color: C.muted
