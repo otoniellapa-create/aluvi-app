@@ -833,6 +833,11 @@ const PAPEIS = {
     edita: true,
     admin: true
   },
+  "Sócio": {
+    lanca: true,
+    edita: true,
+    admin: false
+  },
   "Gerente": {
     lanca: true,
     edita: true,
@@ -849,9 +854,25 @@ const PAPEIS = {
     admin: false
   }
 };
+/* Quem enxerga dinheiro: Financeiro e Planos & Preços.
+   Por padrão só o dono e os sócios — o resto da equipe nem vê os módulos no menu. */
+const FINANCEIRO_POR_CARGO = {
+  "Administrador master": true,
+  "Sócio": true,
+  "Gerente": false,
+  "Operador": false,
+  "Visualizador": false
+};
+const MODULOS_RESTRITOS_FINANCEIRO = ["fin", "planos"];
+const podeVerModulo = (m, perm) => !MODULOS_RESTRITOS_FINANCEIRO.includes(m.id) || !perm || !!perm.financeiro;
 /* padrão de módulos por cargo — o cargo é o atalho, os marcadores individuais afinam */
 const MODULOS_POR_CARGO = {
   "Administrador master": {
+    parametros: true,
+    manejos: true,
+    estoque: true
+  },
+  "Sócio": {
     parametros: true,
     manejos: true,
     estoque: true
@@ -879,7 +900,8 @@ const permDe = usuario => {
     admin: true,
     parametros: true,
     manejos: true,
-    estoque: true
+    estoque: true,
+    financeiro: true
   };
   const base = PAPEIS[usuario.cargo] || PAPEIS["Operador"];
   const mods = MODULOS_POR_CARGO[usuario.cargo] || MODULOS_POR_CARGO["Operador"];
@@ -894,7 +916,8 @@ const permDe = usuario => {
     ...base,
     parametros: escolhe(usuario.podeParametros, mods.parametros),
     manejos: escolhe(usuario.podeManejos, mods.manejos),
-    estoque: escolhe(usuario.podeEstoque, mods.estoque)
+    estoque: escolhe(usuario.podeEstoque, mods.estoque),
+    financeiro: escolhe(usuario.podeFinanceiro, !!FINANCEIRO_POR_CARGO[usuario.cargo])
   };
 };
 
@@ -1120,6 +1143,7 @@ const SEED = () => ({
   equipamentos: [],
   recados: [],
   recadosLidos: [],
+  exclusoes: [],
   tarefasTemplate: [{
     id: uid(),
     hora: "06:30",
@@ -1269,10 +1293,71 @@ function recalcEstoque(d) {
   });
 }
 /* exclusão com lápide (para sincronização): registra o id e filtra */
-function delReg(d, colecao, id) {
+/* nome legível de cada coleção, para o registro de exclusões */
+const ROTULO_COLECAO = {
+  parametros: "Medição de água",
+  arracoamentos: "Trato (ração)",
+  biometrias: "Biometria",
+  mortalidades: "Mortalidade",
+  correcoes: "Correção",
+  lotes: "Lote",
+  tanques: "Tanque",
+  estoque: "Item de estoque",
+  movsEstoque: "Movimento de estoque",
+  equipamentos: "Equipamento",
+  despescas: "Despesca",
+  vendas: "Venda",
+  custos: "Custo",
+  recados: "Recado da equipe",
+  recadosLidos: "Confirmação de leitura",
+  certificacoes: "Item de regularização",
+  certClientes: "Cliente de regularização",
+  usuarios: "Funcionário",
+  lembretes: "Lembrete",
+  manutencoes: "Manutenção"
+};
+function descreverRegistro(colecao, o) {
+  const rot = ROTULO_COLECAO[colecao] || colecao;
+  if (!o) return rot;
+  const partes = [o.tanqueId, o.nome, o.item, o.titulo, o.texto ? String(o.texto).slice(0, 40) : null, o.dataISO ? fmtData(o.dataISO) : null, o.kg ? `${o.kg} kg` : null, o.qtd ? `${o.qtd} un` : null, o.pesoMedioG ? `${o.pesoMedioG} g` : null].filter(Boolean);
+  return `${rot}${partes.length ? " — " + partes.slice(0, 3).join(" · ") : ""}`;
+}
+/* Exclusão com lápide + CASCATA + ARQUIVO PERMANENTE.
+   Ponto único por onde passa toda exclusão do app:
+   1. marca a lápide (para a exclusão valer também nos outros aparelhos)
+   2. apaga junto os lembretes que aquele registro gerou (não ficam órfãos)
+   3. guarda para sempre QUEM apagou, O QUÊ e QUANDO — o administrador master
+      precisa saber, e esse arquivo nunca é apagado pelo app. */
+function delReg(d, colecao, id, descricaoManual) {
   if (!d.deletados) d.deletados = [];
   if (!d.deletados.includes(id)) d.deletados.push(id);
+  const alvo = (d[colecao] || []).find(x => x.id === id);
   d[colecao] = (d[colecao] || []).filter(x => x.id !== id);
+  /* cascata: lembretes gerados por este registro somem junto */
+  let lembretesRemovidos = 0;
+  if (colecao !== "lembretes" && Array.isArray(d.lembretes)) {
+    const orfaos = d.lembretes.filter(l => l.refId === id);
+    lembretesRemovidos = orfaos.length;
+    orfaos.forEach(l => {
+      if (!d.deletados.includes(l.id)) d.deletados.push(l.id);
+    });
+    if (lembretesRemovidos) d.lembretes = d.lembretes.filter(l => l.refId !== id);
+  }
+  /* arquivo permanente da exclusão */
+  if (colecao !== "exclusoes") {
+    if (!d.exclusoes) d.exclusoes = [];
+    d.exclusoes.push({
+      id: uid(),
+      um: Date.now(),
+      ts: Date.now(),
+      dataISO: hojeISO(),
+      colecao,
+      registroId: id,
+      descricao: descricaoManual || descreverRegistro(colecao, alvo),
+      lembretesRemovidos,
+      ...autoria()
+    });
+  }
 }
 
 /* migração leve: garante chaves novas em stores antigos */
@@ -1298,6 +1383,7 @@ function migrar(d) {
   if (!d.usuarios) d.usuarios = [];
   if (!d.recados) d.recados = [];
   if (!d.recadosLidos) d.recadosLidos = [];
+  if (!d.exclusoes) d.exclusoes = [];
   if (!d.patrocinios) d.patrocinios = [];
   if (d.usuarios.length === 0 && d.config.responsaveis?.length) d.usuarios = d.config.responsaveis.map((n, i) => ({
     id: uid(),
@@ -1408,6 +1494,32 @@ function analisarFazenda(s) {
         acao: "Se há defeito ou revisão pendente, acione o fornecedor antes do prazo."
       });
     }
+  });
+  /* exclusões recentes — o administrador master precisa ficar sabendo */
+  const exclRecentes = (s.exclusoes || []).filter(x => x.porQuando && Date.now() - new Date(x.porQuando).getTime() < 2 * 86400000);
+  if (exclRecentes.length) out.push({
+    nivel: "warn",
+    modulo: "config",
+    txt: `${exclRecentes.length} registro(s) apagado(s) nas últimas 48h`,
+    det: `${exclRecentes.slice(0, 3).map(x => `${x.descricao} (por ${autorDe(x) || "—"})`).join(" · ")} — histórico completo em Config & Backup`
+  });
+  /* licenças e certificações vencendo — renovação costuma demorar, avisa com 60 dias */
+  (s.certificacoes || []).forEach(c => {
+    if (!c.validade) return;
+    const dd = diasEntre(hojeISO(), c.validade);
+    if (dd < 0) itens.push({
+      nivel: "crit",
+      modulo: "cert",
+      titulo: `VENCIDA: ${c.item}`,
+      detalhe: `${c.orgao || ""} · venceu em ${fmtData(c.validade)}`,
+      acao: "Operar com licença vencida gera risco de multa e embargo. Providencie a renovação."
+    });else if (dd <= 60) itens.push({
+      nivel: "warn",
+      modulo: "cert",
+      titulo: `Licença vencendo: ${c.item}`,
+      detalhe: `${c.orgao || ""} · até ${fmtData(c.validade)} (${dd} dias)`,
+      acao: "Renovação de licença costuma demorar — comece o processo agora."
+    });
   });
   lotesAtivos(s).forEach(l => {
     const k = calcLote(s, l);
@@ -4017,13 +4129,15 @@ const ParamsScreen = ({
         /* assistente age na inserção: desvio vira ação no manejo do dia */
         const desvios = alertasParametro(d, novo);
         desvios.forEach(dv => {
-          const titulo = `Agir em ${sel}: ${dv.label} fora da faixa`;
+          const titulo = `${dv.nivel === "vermelho" ? "AGIR AGORA" : "Observar"} em ${sel}: ${dv.label}`;
           if (!d.lembretes.some(l => !l.done && l.titulo === titulo)) d.lembretes.push({
             id: uid(),
             um: Date.now(),
             dataISO: v.dataISO || hojeISO(),
             titulo,
+            detalhe: dv.acao || "",
             origem: "Assistente — parâmetros",
+            refId: novo.id,
             done: false
           });
         });
@@ -4544,6 +4658,7 @@ const CorrScreen = ({
           dataISO: lemISO,
           titulo: `Re-medir água de ${sel} (48h após ${v.tipo})`,
           origem: "Correção",
+          refId: cId,
           done: false
         });
       });
@@ -7166,7 +7281,25 @@ const ChecklistCert = ({
         fontSize: 11,
         color: C.muted
       }
-    }, c.orgao, c.obs ? ` · ${c.obs}` : "")), /*#__PURE__*/React.createElement(Chip, {
+    }, [c.orgao, c.numero, c.validade ? `val. ${fmtData(c.validade)}` : null, c.obs].filter(Boolean).join(" · ")), c.arquivoUrl ? /*#__PURE__*/React.createElement("a", {
+      href: c.arquivoUrl,
+      target: "_blank",
+      rel: "noopener noreferrer",
+      onClick: e => e.stopPropagation(),
+      style: {
+        fontSize: 11,
+        color: C.ouroClaro,
+        textDecoration: "none",
+        display: "inline-block",
+        marginTop: 3
+      }
+    }, "📄 ver documento digitalizado") : null, c.ondeFisico ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.muted,
+        marginTop: 2
+      }
+    }, "via física: ", c.ondeFisico) : null), /*#__PURE__*/React.createElement(Chip, {
       nivel: st.nivel
     }, st.txt)));
   }));
@@ -7193,12 +7326,33 @@ const CAMPOS_ITEM_CERT = [{
   req: true,
   options: ["pendente", "em andamento", "obtido"]
 }, {
-  k: "validade",
-  label: "Validade",
+  k: "numero",
+  label: "Nº do documento / protocolo",
+  largo: true,
+  ph: "ex.: RGP 123456 · processo INEMA 2026.0001"
+}, {
+  k: "emissao",
+  label: "Emitido em",
   type: "date"
 }, {
+  k: "validade",
+  label: "Validade",
+  type: "date",
+  dica: "O app avisa 60 dias antes de vencer"
+}, {
+  k: "arquivoUrl",
+  label: "Documento digitalizado (link)",
+  largo: true,
+  ph: "cole o link do Drive, OneDrive, Dropbox…",
+  dica: "Escaneie ou fotografe o documento, guarde na nuvem e cole o link aqui — fica a um toque de distância na fiscalização"
+}, {
+  k: "ondeFisico",
+  label: "Onde está a via física",
+  largo: true,
+  ph: "ex.: pasta azul, armário do escritório"
+}, {
   k: "obs",
-  label: "Observações / nº do processo",
+  label: "Observações",
   largo: true
 }];
 const CertScreen = ({
@@ -9620,7 +9774,12 @@ const LancarScreen = ({
 const ModulosScreen = ({
   nav
 }) => {
-  const grupos = [...new Set(MODULOS.filter(m => m.grupo).map(m => m.grupo))];
+  const {
+    perm
+  } = useApp();
+  /* módulos de dinheiro só aparecem para quem tem acesso ao financeiro */
+  const visiveis = MODULOS.filter(m => podeVerModulo(m, perm));
+  const grupos = [...new Set(visiveis.filter(m => m.grupo).map(m => m.grupo))];
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       margin: "6px 2px 8px"
@@ -9649,7 +9808,7 @@ const ModulosScreen = ({
       gridTemplateColumns: "1fr 1fr 1fr",
       gap: 8
     }
-  }, MODULOS.filter(m => m.grupo === g).map(m => /*#__PURE__*/React.createElement("div", {
+  }, visiveis.filter(m => m.grupo === g).map(m => /*#__PURE__*/React.createElement("div", {
     key: m.id,
     onClick: () => nav(m.id),
     style: {
@@ -9681,8 +9840,72 @@ const ModulosScreen = ({
 };
 
 /* -------- Config & Backup -------- */
-const CARGOS = ["Administrador master", "Gerente", "Operador", "Visualizador"];
-const ConfigScreen = () => {
+const CARGOS = ["Administrador master", "Sócio", "Gerente", "Operador", "Visualizador"];
+/* ===== Registro de exclusões — arquivo permanente, só para o Administrador master =====
+   Toda exclusão feita no app fica aqui: quem apagou, o quê e quando.
+   O app nunca apaga este arquivo. É a trilha de auditoria da fazenda. */
+const CardExclusoes = () => {
+  const {
+    s,
+    perm
+  } = useApp();
+  const [aberto, setAberto] = useState(false);
+  if (!perm || !perm.admin) return null;
+  const lista = (s.exclusoes || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  if (!lista.length) return null;
+  const recentes = lista.filter(x => x.porQuando && Date.now() - new Date(x.porQuando).getTime() < 2 * 86400000);
+  const mostrar = aberto ? lista : lista.slice(0, 5);
+  return /*#__PURE__*/React.createElement(Card, {
+    style: {
+      borderLeft: `3px solid ${recentes.length ? C.warn : C.line2}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: C.ouroClaro,
+      letterSpacing: 0.4,
+      marginBottom: 6
+    }
+  }, "REGISTRO DE EXCLUSÕES"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.ink2,
+      lineHeight: 1.5,
+      marginBottom: 4
+    }
+  }, "Tudo que for apagado no app fica registrado aqui — quem apagou, o quê e quando. Este arquivo não é apagado e só o Administrador master enxerga.", recentes.length ? /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: C.warn
+    }
+  }, ` ${recentes.length} nas últimas 48h.`) : ""), mostrar.map(x => /*#__PURE__*/React.createElement("div", {
+    key: x.id,
+    style: {
+      borderTop: `1px solid ${C.line}`,
+      padding: "7px 0"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.ink
+    }
+  }, x.descricao), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.muted,
+      marginTop: 2
+    }
+  }, "por ", autorDe(x) || "—", quandoDe(x) ? ` · ${quandoDe(x)}` : "", x.lembretesRemovidos ? ` · ${x.lembretesRemovidos} lembrete(s) removido(s) junto` : ""))), lista.length > 5 && /*#__PURE__*/React.createElement(Btn, {
+    pequeno: true,
+    tipo: "escuro",
+    style: {
+      marginTop: 8
+    },
+    onClick: () => setAberto(!aberto)
+  }, aberto ? "mostrar menos" : `ver todos (${lista.length})`));
+};
+
+const ConfigScreen =() => {
   const {
     s,
     up,
@@ -9733,7 +9956,7 @@ const ConfigScreen = () => {
     r.readAsText(f);
     e.target.value = "";
   };
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(H2, null, "Configurações & backup"), usuario && /*#__PURE__*/React.createElement(Card, {
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(H2, null, "Configurações & backup"), /*#__PURE__*/React.createElement(CardExclusoes, null), usuario && /*#__PURE__*/React.createElement(Card, {
     style: {
       padding: "10px 14px"
     }
@@ -9946,6 +10169,12 @@ const ConfigScreen = () => {
       type: "select",
       options: ["Sim", "Não"],
       dica: "Entrada e recepção de insumos"
+    }, {
+      k: "podeFinanceiro",
+      label: "Pode ver o Financeiro",
+      type: "select",
+      options: ["Sim", "Não"],
+      dica: "Libera os módulos Financeiro e Planos & Preços. Quem não tem acesso nem vê no menu. Padrão: só Administrador master e Sócio"
     }, {
       k: "pin",
       label: "PIN de entrada (opcional)",
@@ -10762,6 +10991,82 @@ const MuralScreen = () => {
   }));
 };
 
+/* ================= Sinaleira — status da fazenda em qualquer tela =================
+   Fica fixa no topo, em todas as páginas. Mostra a pior situação atual da fazenda:
+   vermelho (crítico) > amarelo (atenção) > verde (tudo normal). Um toque leva aos alertas.
+   Assim o problema não passa despercebido, esteja o funcionário em que tela estiver. */
+const Sinaleira = ({
+  nav
+}) => {
+  const {
+    s
+  } = useApp();
+  /* recalcula só quando os dados mudam — roda em toda tela, precisa ser leve */
+  const an = React.useMemo(() => analisarFazenda(s), [s]);
+  const nivel = an.crit > 0 ? "vermelho" : an.warn > 0 ? "amarelo" : "verde";
+  const cor = corNivel(nivel);
+  const txt = an.crit > 0 ? `${an.crit} crítico${an.crit > 1 ? "s" : ""}` : an.warn > 0 ? `${an.warn} atenção` : "tudo normal";
+  const luz = (acesa, c) => /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 9,
+      height: 9,
+      borderRadius: "50%",
+      display: "block",
+      background: acesa ? c : "rgba(245,241,230,0.12)",
+      boxShadow: acesa ? `0 0 7px ${c}` : "none",
+      transition: "background .2s, box-shadow .2s"
+    }
+  });
+  return /*#__PURE__*/React.createElement("button", {
+    onClick: () => nav && nav("ia"),
+    title: `Status da fazenda: ${txt} — toque para ver os alertas`,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      background: bgNivel(nivel),
+      border: `1px solid ${cor}`,
+      borderRadius: 999,
+      padding: "4px 11px 4px 5px",
+      cursor: "pointer",
+      flexShrink: 0
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "flex",
+      gap: 4,
+      alignItems: "center",
+      background: "rgba(4,12,16,0.55)",
+      borderRadius: 999,
+      padding: "4px 6px"
+    }
+  }, luz(nivel === "vermelho", C.crit), luz(nivel === "amarelo", C.warn), luz(nivel === "verde", C.ok)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: cor,
+      whiteSpace: "nowrap",
+      letterSpacing: 0.2
+    }
+  }, txt));
+};
+
+/* trava de segurança: mesmo que alguém chegue à tela por outro caminho, não vê o conteúdo */
+const SemAcesso = () => /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: C.warn,
+    marginBottom: 6
+  }
+}, "Acesso restrito"), /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 12,
+    color: C.ink2,
+    lineHeight: 1.5
+  }
+}, "Os módulos ", /*#__PURE__*/React.createElement("b", null, "Financeiro"), " e ", /*#__PURE__*/React.createElement("b", null, "Planos & Preços"), " são visíveis apenas para o Administrador master e para os Sócios. Se você precisa desse acesso, peça ao administrador da fazenda."));
+
 /* ================= App root ================= */
 const TELAS = {
   home: Home,
@@ -11041,7 +11346,7 @@ function AppCarregado({
     s: s,
     aoEntrar: setUsuario
   });
-  const Tela = TELAS[tela] || Home;
+  const Tela = MODULOS_RESTRITOS_FINANCEIRO.includes(tela) && perm && !perm.financeiro ? SemAcesso : TELAS[tela] || Home;
   const navMobile = [{
     id: "home",
     label: "Início",
@@ -11063,7 +11368,9 @@ function AppCarregado({
     label: "Módulos",
     icone: IC.mais
   }];
-  const grupos = [...new Set(MODULOS.filter(m => m.grupo).map(m => m.grupo))];
+  /* módulos de dinheiro só aparecem no menu para quem tem acesso ao financeiro */
+  const modulosVisiveis = MODULOS.filter(m => podeVerModulo(m, perm));
+  const grupos = [...new Set(modulosVisiveis.filter(m => m.grupo).map(m => m.grupo))];
   return /*#__PURE__*/React.createElement(Ctx.Provider, {
     value: api
   }, /*#__PURE__*/React.createElement("div", {
@@ -11124,7 +11431,7 @@ function AppCarregado({
       margin: "14px 8px 4px",
       textTransform: "uppercase"
     }
-  }, g), MODULOS.filter(m => m.grupo === g).map(m => /*#__PURE__*/React.createElement(ItemNav, {
+  }, g), modulosVisiveis.filter(m => m.grupo === g).map(m => /*#__PURE__*/React.createElement(ItemNav, {
     key: m.id,
     m: m,
     ativo: tela === m.id,
@@ -11161,7 +11468,7 @@ function AppCarregado({
       flex: 1,
       minWidth: 0
     }
-  }, !desktop && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
     className: "no-print",
     style: {
       position: "sticky",
@@ -11170,14 +11477,24 @@ function AppCarregado({
       background: `linear-gradient(180deg, ${C.bg1}, ${C.bg1}f2)`,
       backdropFilter: "blur(8px)",
       borderBottom: `1px solid ${C.line}`,
-      padding: "10px 14px",
+      padding: desktop ? "8px 28px" : "10px 14px",
       display: "flex",
       justifyContent: "space-between",
-      alignItems: "center"
+      alignItems: "center",
+      gap: 10
     }
-  }, /*#__PURE__*/React.createElement(Marca, {
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      minWidth: 0
+    }
+  }, !desktop && /*#__PURE__*/React.createElement(Marca, {
     compacta: true
-  }), /*#__PURE__*/React.createElement(SyncDot, {
+  }), /*#__PURE__*/React.createElement(Sinaleira, {
+    nav: nav
+  })), /*#__PURE__*/React.createElement(SyncDot, {
     sync: sync,
     nuvemAtiva: !!s.config.nuvem?.ativa
   })), /*#__PURE__*/React.createElement("div", {
