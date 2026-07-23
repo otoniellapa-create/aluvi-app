@@ -708,6 +708,34 @@ const quandoDe = r => {
   });
 };
 
+/* Cadastro de fornecedor na hora, direto do formulário de estoque:
+   se o usuário escreveu um nome em "novoFornecedor", cria o fornecedor e
+   liga o item a ele, sem precisar ir antes ao módulo Fornecedores. */
+function adicionaFornecedorInline(d, v) {
+  const out = {
+    ...v
+  };
+  const nome = (out.novoFornecedor || "").trim();
+  delete out.novoFornecedor;
+  if (nome) {
+    if (!d.fornecedores) d.fornecedores = [];
+    const jaExiste = d.fornecedores.find(f => (f.nome || "").trim().toLowerCase() === nome.toLowerCase());
+    if (jaExiste) {
+      out.fornecedorId = jaExiste.id;
+    } else {
+      const nf = {
+        id: uid(),
+        um: Date.now(),
+        nome,
+        tipo: "fornecedor"
+      };
+      d.fornecedores.push(nf);
+      out.fornecedorId = nf.id;
+    }
+  }
+  return out;
+}
+
 /* tabela de referência de arraçoamento — tilápia (geral; ajuste com engenheiro/fabricante) */
 const TABELA_ARR = [{
   ate: 10,
@@ -5063,14 +5091,20 @@ const StockScreen = ({
       })),
       dica: "Liga o item ao pedido por WhatsApp",
       largo: true
+    }, {
+      k: "novoFornecedor",
+      label: "…ou cadastre um novo fornecedor",
+      largo: true,
+      dica: "Se não estiver na lista acima, escreva o nome aqui — o app cadastra na hora"
     }],
     onSalvar: v => {
       up(d => {
+        const dados = adicionaFornecedorInline(d, v);
         d.estoque.push({
           id: uid(),
           um: Date.now(),
-          ...v,
-          qtd: v.qtd || 0
+          ...dados,
+          qtd: dados.qtd || 0
         });
       });
       setModal(null);
@@ -5111,9 +5145,15 @@ const StockScreen = ({
         t: f.nome
       })),
       largo: true
+    }, {
+      k: "novoFornecedor",
+      label: "…ou cadastre um novo fornecedor",
+      largo: true,
+      dica: "Se não estiver na lista, escreva o nome aqui — o app cadastra na hora"
     }],
     onSalvar: v => {
       up(d => {
+        v = adicionaFornecedorInline(d, v);
         const it = d.estoque.find(i => i.id === modal.item.id);
         if (!it) return;
         if (v.qtd !== it.qtd) d.movsEstoque.push({
@@ -9342,6 +9382,11 @@ const MODULOS = [{
   grupo: "Operação diária",
   icone: IC.gota
 }, {
+  id: "condicoes",
+  label: "Condições ideais",
+  grupo: "Operação diária",
+  icone: IC.gota
+}, {
   id: "feed",
   label: "Arraçoamento",
   grupo: "Operação diária",
@@ -11068,12 +11113,143 @@ const SemAcesso = () => /*#__PURE__*/React.createElement(Card, null, /*#__PURE__
   }
 }, "Os módulos ", /*#__PURE__*/React.createElement("b", null, "Financeiro"), " e ", /*#__PURE__*/React.createElement("b", null, "Planos & Preços"), " são visíveis apenas para o Administrador master e para os Sócios. Se você precisa desse acesso, peça ao administrador da fazenda."));
 
+/* ================= Condições ideais — faixas de referência dos parâmetros ================= */
+const ORDEM_PARAMS = ["temp", "od", "ph", "amonia", "nitrito", "alcalinidade", "salinidade", "nitrato", "dureza", "solidos"];
+function textoFaixaIdeal(f) {
+  const un = f.unit ? " " + f.unit : "";
+  const temMin = f.min !== null && f.min !== undefined;
+  const temMax = f.max !== null && f.max !== undefined;
+  if (temMin && temMax) return `${fmtNum(f.min, f.min % 1 ? 1 : 0)} a ${fmtNum(f.max, f.max % 1 ? 1 : 0)}${un}`;
+  if (temMin) return `mínimo ${fmtNum(f.min, f.min % 1 ? 1 : 0)}${un}`;
+  if (temMax) return `máximo ${fmtNum(f.max, f.max % 1 ? 1 : 0)}${un}`;
+  return "—";
+}
+function textoCritico(k, f) {
+  const cr = FAIXAS_CRIT[k] || {};
+  const un = f.unit ? " " + f.unit : "";
+  const p = [];
+  if (cr.critMin !== null && cr.critMin !== undefined) p.push(`abaixo de ${fmtNum(cr.critMin, cr.critMin % 1 ? 1 : 0)}${un}`);
+  if (cr.critMax !== null && cr.critMax !== undefined) p.push(`acima de ${fmtNum(cr.critMax, cr.critMax % 1 ? 1 : 0)}${un}`);
+  return p.join(" ou ");
+}
+const CondicoesScreen = () => {
+  const {
+    s,
+    up,
+    perm
+  } = useApp();
+  const [modal, setModal] = useState(false);
+  const F = s.config.faixas;
+  const podeEditar = !perm || perm.admin;
+  const legenda = (cor, txt) => /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 5,
+      fontSize: 11,
+      color: C.ink2
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 9,
+      height: 9,
+      borderRadius: "50%",
+      background: cor,
+      display: "inline-block"
+    }
+  }), txt);
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(H2, null, "Condições ideais"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.ink2,
+      lineHeight: 1.5,
+      marginBottom: 10
+    }
+  }, "A faixa ideal de cada parâmetro que influencia a produção. É a referência da equipe na hora de lançar os ", /*#__PURE__*/React.createElement("b", null, "Parâmetros"), ", e é o que acende o ", /*#__PURE__*/React.createElement("b", null, "semáforo"), " (verde/amarelo/vermelho) automaticamente."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 14,
+      flexWrap: "wrap",
+      marginBottom: 12
+    }
+  }, legenda(C.ok, "verde = ideal"), legenda(C.warn, "amarelo = atenção"), legenda(C.crit, "vermelho = agir")), podeEditar && /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => setModal(true)
+  }, "Editar faixas"), ORDEM_PARAMS.map(k => {
+    const f = F[k];
+    if (!f) return null;
+    const crit = textoCritico(k, f);
+    return /*#__PURE__*/React.createElement(Card, {
+      key: k,
+      style: {
+        marginBottom: 8
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 14,
+        fontWeight: 700,
+        color: C.ink,
+        marginBottom: 6
+      }
+    }, f.label), /*#__PURE__*/React.createElement(KV, {
+      linhas: [["🟢 Ideal", textoFaixaIdeal(f), C.ok], ...(crit ? [["🔴 Crítico", crit, C.crit]] : [])]
+    }), (FAIXAS_CRIT[k] || {}).acao ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: C.muted,
+        marginTop: 4,
+        lineHeight: 1.5
+      }
+    }, "No vermelho: ", (FAIXAS_CRIT[k] || {}).acao) : null);
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.muted,
+      lineHeight: 1.5,
+      marginTop: 10
+    }
+  }, "As faixas de referência são um ponto de partida técnico — confirme com seu engenheiro de pesca. Editar aqui muda os alertas do app na hora."), modal && /*#__PURE__*/React.createElement(FormModal, {
+    titulo: "Editar faixas ideais",
+    onFechar: () => setModal(false),
+    inicial: Object.fromEntries(Object.entries(F).flatMap(([k, f]) => [[k + "_min", f.min], [k + "_max", f.max]])),
+    campos: ORDEM_PARAMS.filter(k => F[k]).flatMap(k => [{
+      k: k + "_min",
+      label: `${F[k].label} — mín.`,
+      type: "number",
+      unit: F[k].unit
+    }, {
+      k: k + "_max",
+      label: `${F[k].label} — máx.`,
+      type: "number",
+      unit: F[k].unit
+    }]),
+    extra: /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: C.muted,
+        margin: "0 0 8px",
+        lineHeight: 1.5
+      }
+    }, "Deixe vazio pra não alertar naquele limite (ex.: oxigênio só tem mínimo). Confirme os valores com seu engenheiro."),
+    onSalvar: v => {
+      up(d => {
+        Object.keys(d.config.faixas).forEach(k => {
+          if (v[k + "_min"] !== undefined) d.config.faixas[k].min = v[k + "_min"] === "" ? null : num(v[k + "_min"]);
+          if (v[k + "_max"] !== undefined) d.config.faixas[k].max = v[k + "_max"] === "" ? null : num(v[k + "_max"]);
+        });
+        d.config.um = Date.now();
+      });
+      setModal(false);
+    }
+  }));
+};
+
 /* ================= App root ================= */
 const TELAS = {
   home: Home,
   lancar: LancarScreen,
   modulos: ModulosScreen,
   params: ParamsScreen,
+  condicoes: CondicoesScreen,
   feed: FeedScreen,
   bio: BioScreen,
   corr: CorrScreen,
