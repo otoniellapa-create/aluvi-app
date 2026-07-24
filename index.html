@@ -4901,6 +4901,141 @@ const MortScreen = ({
 };
 
 /* ================= Estoque ================= */
+/* ===== Foto da nota fiscal (Fase 5) — Supabase Storage, bucket privado aluvi-notas =====
+   Comprime a foto no aparelho (pra não pesar), envia pro Storage e guarda só o caminho.
+   Ver depois gera um link temporário assinado (o balde é privado). */
+async function comprimirImagem(file, maxLado, qualidade) {
+  maxLado = maxLado || 1400;
+  qualidade = qualidade || 0.7;
+  try {
+    const dataUrl = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = rej;
+      fr.readAsDataURL(file);
+    });
+    const img = await new Promise((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = rej;
+      im.src = dataUrl;
+    });
+    let w = img.width,
+      h = img.height;
+    if (Math.max(w, h) > maxLado) {
+      const r = maxLado / Math.max(w, h);
+      w = Math.round(w * r);
+      h = Math.round(h * r);
+    }
+    const cv = document.createElement("canvas");
+    cv.width = w;
+    cv.height = h;
+    cv.getContext("2d").drawImage(img, 0, 0, w, h);
+    const blob = await new Promise(res => cv.toBlob(res, "image/jpeg", qualidade));
+    return blob || file;
+  } catch (e) {
+    return file;
+  }
+}
+async function uploadNotaStorage(blob) {
+  const tok = window.__aluviAuth && window.__aluviAuth.getToken && window.__aluviAuth.getToken() || SUPA_KEY;
+  const path = new Date().toISOString().slice(0, 10) + "/" + Date.now() + "-" + Math.random().toString(36).slice(2, 7) + ".jpg";
+  const r = await fetch(SUPA_URL + "/storage/v1/object/aluvi-notas/" + path, {
+    method: "POST",
+    headers: {
+      apikey: SUPA_KEY,
+      Authorization: "Bearer " + tok,
+      "Content-Type": "image/jpeg"
+    },
+    body: blob
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error("Falha no upload (" + r.status + ") " + t.slice(0, 90));
+  }
+  return path;
+}
+async function assinarUrlNota(path) {
+  const tok = window.__aluviAuth && window.__aluviAuth.getToken && window.__aluviAuth.getToken() || SUPA_KEY;
+  const r = await fetch(SUPA_URL + "/storage/v1/object/sign/aluvi-notas/" + path, {
+    method: "POST",
+    headers: {
+      apikey: SUPA_KEY,
+      Authorization: "Bearer " + tok,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      expiresIn: 3600
+    })
+  });
+  if (!r.ok) throw new Error("Falha ao gerar o link (" + r.status + ")");
+  const d = await r.json();
+  return SUPA_URL + "/storage/v1" + d.signedURL;
+}
+const FotoNota = ({
+  onUpload
+}) => {
+  const [estado, setEstado] = useState("");
+  const [msg, setMsg] = useState("");
+  const onSel = async e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setEstado("enviando");
+    setMsg("Comprimindo e enviando a foto…");
+    try {
+      const blob = await comprimirImagem(file);
+      const path = await uploadNotaStorage(blob);
+      if (onUpload) onUpload(path);
+      setEstado("ok");
+      setMsg("Foto da nota anexada ✓");
+    } catch (err) {
+      if (onUpload) onUpload(null);
+      setEstado("erro");
+      setMsg(err.message || "Não foi possível enviar a foto.");
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      margin: "2px 0 10px",
+      textAlign: "left"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.ink2,
+      marginBottom: 4
+    }
+  }, "📷 Foto da nota fiscal ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "(opcional)")), /*#__PURE__*/React.createElement("input", {
+    type: "file",
+    accept: "image/*",
+    capture: "environment",
+    onChange: onSel,
+    disabled: estado === "enviando",
+    style: {
+      fontSize: 12,
+      color: C.ink2
+    }
+  }), msg ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      marginTop: 4,
+      color: estado === "ok" ? C.ok : estado === "erro" ? C.crit : C.muted
+    }
+  }, msg) : null);
+};
+async function verNota(path) {
+  try {
+    const url = await assinarUrlNota(path);
+    window.open(url, "_blank", "noopener");
+  } catch (e) {
+    window.alert(e.message || "Não foi possível abrir a foto.");
+  }
+}
+
 const StockScreen = ({
   ctx
 }) => {
@@ -4911,6 +5046,7 @@ const StockScreen = ({
   const [modal, setModal] = useState(ctx?.autoOpen ? {
     tipo: "entrada"
   } : null);
+  const fotoNotaRef = useRef(null);
   const cats = [...new Set(s.estoque.map(i => i.categoria))];
   const statusItem = it => {
     const cons = consumoDiario7d(s, it.id);
@@ -4937,9 +5073,12 @@ const StockScreen = ({
       })
     }, "+ item")
   }, "Estoque"), /*#__PURE__*/React.createElement(Btn, {
-    onClick: () => setModal({
-      tipo: "entrada"
-    })
+    onClick: () => {
+      fotoNotaRef.current = null;
+      setModal({
+        tipo: "entrada"
+      });
+    }
   }, "+ Registrar entrada de material"), /*#__PURE__*/React.createElement("div", {
     style: {
       height: 10
@@ -5036,7 +5175,47 @@ const StockScreen = ({
       color: C.muted,
       margin: "10px 2px"
     }
-  }, "“≈Nd” = dias restantes pela média de consumo dos últimos 7 dias. Toque num item pra editar."), modal?.tipo === "entrada" && /*#__PURE__*/React.createElement(FormModal, {
+  }, "“≈Nd” = dias restantes pela média de consumo dos últimos 7 dias. Toque num item pra editar."), (() => {
+    const comFoto = (s.movsEstoque || []).filter(m => m.tipo === "entrada" && m.notaFotoPath).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 20);
+    if (!comFoto.length) return null;
+    return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(H2, null, "Notas recebidas"), comFoto.map(m => {
+      const it = s.estoque.find(i => i.id === m.itemId);
+      return /*#__PURE__*/React.createElement(Card, {
+        key: m.id,
+        style: {
+          padding: "10px 14px",
+          marginBottom: 6,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 10
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          minWidth: 0
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 13,
+          fontWeight: 700,
+          color: C.ink
+        }
+      }, it ? it.nome : "Item"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 11,
+          color: C.muted
+        }
+      }, fmtData(m.dataISO), m.obs ? " · " + m.obs : "", autorDe(m) ? " · por " + autorDe(m) : "")), /*#__PURE__*/React.createElement(Btn, {
+        pequeno: true,
+        tipo: "escuro",
+        style: {
+          width: "auto",
+          flexShrink: 0
+        },
+        onClick: () => verNota(m.notaFotoPath)
+      }, "📄 ver nota"));
+    }));
+  })(), modal?.tipo === "entrada" && /*#__PURE__*/React.createElement(FormModal, {
     titulo: "Entrada de material",
     modulo: "estoque",
     onFechar: () => setModal(null),
@@ -5078,7 +5257,14 @@ const StockScreen = ({
       label: "Fornecedor / NF",
       largo: true
     }],
+    extra: /*#__PURE__*/React.createElement(FotoNota, {
+      onUpload: p => {
+        fotoNotaRef.current = p;
+      }
+    }),
     onSalvar: v => {
+      const fotoPath = fotoNotaRef.current || null;
+      fotoNotaRef.current = null;
       up(d => {
         const it = d.estoque.find(i => i.id === v.itemId);
         if (!it) return;
@@ -5092,7 +5278,8 @@ const StockScreen = ({
           ts: Date.now(),
           tipo: "entrada",
           qtd: v.qtd,
-          obs: v.obs
+          obs: v.obs,
+          notaFotoPath: fotoPath
         });
         if (v.lancarCusto === "Sim" && v.precoUnit && v.qtd) {
           const catMap = {
