@@ -666,6 +666,15 @@ const FAIXAS_DEFAULT = {
     max: 30,
     label: "Sólidos sedim. (cone Imhoff)",
     unit: "mL/L"
+  },
+  /* Amônia tóxica (NH₃) — calculada, não medida.
+     O kit mede amônia TOTAL; o que intoxica o peixe é a fração não ionizada (NH₃),
+     que depende do pH e da temperatura. Ideal até 0,02 · crítico acima de 0,05 mg/L. */
+  nh3: {
+    min: null,
+    max: 0.02,
+    label: "Amônia tóxica (NH₃)",
+    unit: "mg/L"
   }
 };
 
@@ -724,8 +733,55 @@ const FAIXAS_CRIT = {
     critMin: 3,
     critMax: 50,
     acao: "Acima do limite, decante/remova o excesso de floco (consome oxigênio e entope brânquia). Abaixo, o floco está imaturo."
+  },
+  nh3: {
+    critMin: null,
+    critMax: 0.05,
+    acao: "Amônia tóxica acima do limite: reduza/suspenda o arraçoamento AGORA, reforce a aeração e renove parte da água. Baixar o pH derruba a toxicidade na hora — mas só faça isso com orientação técnica, porque queda brusca de pH estressa o peixe."
   }
 };
+
+/* ===== Amônia tóxica (NH₃) — o cálculo que a tabela impressa faz no papel =====
+   O kit mede amônia TOTAL. O que intoxica o peixe é a fração não ionizada (NH₃),
+   e essa fração depende do pH e da temperatura da água: quanto mais alto o pH e
+   mais quente, maior a parcela tóxica.
+
+   Exemplo real (Águas Douradas, 08/08/2026): B2 e E6 mediram 4,0 mg/L de amônia
+   total — o mesmo número no kit. Mas o B2 estava a pH 6,0 (NH₃ ≈ 0,002 — seguro)
+   e o E6 a pH 7,5 (NH₃ ≈ 0,055 — acima do limite). Sem esta conta, o app trataria
+   os dois igual: alarme falso num, risco despercebido no outro.
+
+   pKa por Emerson et al. (1975). Conferido contra a tabela impressa da equipe:
+   pH 7,4 / 25 °C / 3,5 mg/L → tabela 0,049 · fórmula 0,0492.
+   A salinidade altera o pKa marginalmente; nas faixas da fazenda (3–6 ppt) o efeito
+   é desprezível e foi ignorado de propósito, pra manter a conta simples e auditável. */
+function calcularNH3(amoniaTotal, pH, tempC) {
+  if (!temNum(amoniaTotal) || !temNum(pH) || !temNum(tempC)) return null;
+  const T = Number(tempC) + 273.15;
+  if (T <= 0) return null;
+  const pKa = 0.09018 + 2729.92 / T;
+  const fracao = 1 / (1 + Math.pow(10, pKa - Number(pH)));
+  return Number(amoniaTotal) * fracao;
+}
+/* temperatura média da medição (superfície/meio/fundo — o que tiver) */
+function tempMediaDe(p) {
+  if (!p) return null;
+  const t = [p.tempSup, p.tempMeio, p.tempFundo].filter(v => v !== null && v !== undefined && !isNaN(v));
+  return t.length ? t.reduce((a, b) => a + b, 0) / t.length : null;
+}
+/* NH₃ de uma medição + o que está faltando pra calcular.
+   Nunca bloqueia o lançamento: se falta pH ou temperatura, devolve o que falta
+   pra equipe completar depois. */
+function nh3De(p) {
+  if (!p) return { valor: null, falta: [] };
+  const temp = tempMediaDe(p);
+  if (!temNum(p.amonia)) return { valor: null, falta: [] };
+  const falta = [];
+  if (!temNum(p.ph)) falta.push("o pH");
+  if (!temNum(temp)) falta.push("a temperatura");
+  if (falta.length) return { valor: null, falta };
+  return { valor: calcularNH3(p.amonia, p.ph, temp), falta: [] };
+}
 const AVISO_SUGESTAO = "Sugestão automática com base nos parâmetros. Não é prescrição — a decisão de manejo é de responsabilidade do produtor. Na dúvida, fale com um profissional habilitado.";
 
 /* ===== Rede de proteção contra erro de digitação =====
@@ -1478,9 +1534,14 @@ function migrar(d) {
     tipoRede: "",
     precoKwh: null
   };
-  ["nitrato", "dureza", "solidos"].forEach(k => {
+  ["nitrato", "dureza", "solidos", "nh3"].forEach(k => {
     if (!d.config.faixas[k]) d.config.faixas[k] = FAIXAS_DEFAULT[k];
   });
+  /* limites críticos passam a ser editáveis pela fazenda (Condições ideais).
+     Sem isso, ideal e crítico podiam se contradizer — nitrato ideal até 150 e
+     crítico acima de 100 ao mesmo tempo. */
+  if (!d.config.faixasCrit) d.config.faixasCrit = {};
+  aplicarCriticasDoConfig(d.config);
   if (!d.usuarios) d.usuarios = [];
   if (!d.recados) d.recados = [];
   if (!d.recadosLidos) d.recadosLidos = [];
@@ -1879,9 +1940,26 @@ const checaFaixa = (faixa, v) => {
 /* nível do semáforo: "verde" (dentro da faixa), "amarelo" (fora, mas antes do crítico),
    "vermelho" (passou do crítico) ou null quando não há medida. */
 const temNum = v => v !== null && v !== undefined && !isNaN(v);
+/* Limites críticos ATIVOS. Começam nos valores de fábrica e passam a valer os do
+   config assim que a fazenda edita (Condições ideais). Ficam aqui fora porque
+   nivelFaixa é chamada em dezenas de pontos que não têm acesso ao store. */
+let FAIXAS_CRIT_ATIVAS = FAIXAS_CRIT;
+function aplicarCriticasDoConfig(cfg) {
+  const dc = cfg && cfg.faixasCrit || {};
+  const out = {};
+  Object.keys(FAIXAS_CRIT).forEach(k => {
+    out[k] = {
+      ...FAIXAS_CRIT[k],
+      ...(dc[k] || {})
+    };
+  });
+  FAIXAS_CRIT_ATIVAS = out;
+  return out;
+}
+const critDe = k => FAIXAS_CRIT_ATIVAS[k] || FAIXAS_CRIT[k] || {};
 const nivelFaixa = (chave, faixa, v) => {
   if (!temNum(v) || !faixa) return null;
-  const cr = FAIXAS_CRIT[chave] || {};
+  const cr = critDe(chave);
   if (temNum(cr.critMin) && v < cr.critMin) return "vermelho";
   if (temNum(cr.critMax) && v > cr.critMax) return "vermelho";
   if (temNum(faixa.min) && v < faixa.min) return "amarelo";
@@ -1907,7 +1985,7 @@ function alertasParametro(s, p) {
       faixa: F[k],
       valor: v,
       nivel,
-      acao: (FAIXAS_CRIT[k] || {}).acao || ""
+      acao: critDe(k).acao || ""
     });
   };
   const t = [p.tempSup, p.tempMeio, p.tempFundo].filter(v => v !== null && v !== undefined);
@@ -1915,11 +1993,63 @@ function alertasParametro(s, p) {
     const media = t.reduce((a, b) => a + b, 0) / t.length;
     add("temp", media, `Temperatura ${fmtNum(media)}°C`);
   }
+  /* Amônia tóxica entra ANTES da amônia total: é ela que diz se o peixe corre risco
+     agora. A total continua logo abaixo, porque ela diz se o floco está processando
+     o nitrogênio — problema de sistema, mesmo quando a tóxica está baixa. */
+  const nh = nh3De(p);
+  if (nh.valor !== null) add("nh3", nh.valor, `Amônia tóxica (NH₃) ${fmtNum(nh.valor, 3)} mg/L`);else if (nh.falta.length) out.push({
+    k: "nh3_pendente",
+    label: `Amônia tóxica não calculada — falta ${nh.falta.join(" e ")}`,
+    faixa: F.nh3 || { min: null, max: null, unit: "mg/L" },
+    valor: null,
+    nivel: "amarelo",
+    pendencia: true,
+    acao: `A amônia total foi registrada, mas sem ${nh.falta.join(" e ")} não dá pra saber quanto dela está na forma tóxica. Complete a medição — é o que separa um susto de um problema de verdade.`
+  });
   ["amonia", "nitrito", "alcalinidade", "ph", "od", "salinidade", "nitrato", "dureza", "solidos"].forEach(k => {
     if (!F[k]) return;
     add(k, p[k], `${F[k].label} ${fmtNum(p[k], k === "alcalinidade" ? 0 : 1)}${F[k].unit ? " " + F[k].unit : ""}`);
   });
   return out;
+}
+/* ===== Ordem de urgência dos parâmetros =====
+   Não é ordem alfabética nem a ordem do formulário: é quanto tempo o produtor tem
+   pra reagir. Oxigênio mata em horas; nitrato, não. O primeiro nome que aparece no
+   card do tanque é sempre o que deve ser resolvido primeiro. */
+const ORDEM_URGENCIA = ["od", "nh3", "nh3_pendente", "nitrito", "amonia", "ph", "alcalinidade", "temp", "nitrato", "salinidade", "solidos", "dureza"];
+const NOME_CURTO = {
+  od: "Oxigênio",
+  nh3: "Amônia tóxica",
+  nh3_pendente: "Falta pH/temp.",
+  nitrito: "Nitrito",
+  amonia: "Amônia",
+  ph: "pH",
+  alcalinidade: "Alcalinidade",
+  temp: "Temperatura",
+  nitrato: "Nitrato",
+  salinidade: "Salinidade",
+  solidos: "Sólidos",
+  dureza: "Dureza"
+};
+/* resumo do tanque pro card da Home: em vez de "água fora" (que não diz nada e
+   parece erro do app), o nome do que está fora — até 3, o pior primeiro. */
+function resumoTanque(s, tanqueId) {
+  const p = s.parametros.filter(x => x.tanqueId === tanqueId).sort((a, b) => b.ts - a.ts)[0];
+  if (!p) return { nivel: null, nomes: [], extra: 0 };
+  const al = alertasParametro(s, p).slice().sort((a, b) => {
+    const pa = a.nivel === "vermelho" ? 0 : 1,
+      pb = b.nivel === "vermelho" ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    const ia = ORDEM_URGENCIA.indexOf(a.k),
+      ib = ORDEM_URGENCIA.indexOf(b.k);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  if (!al.length) return { nivel: "verde", nomes: [], extra: 0 };
+  return {
+    nivel: al.some(a => a.nivel === "vermelho") ? "vermelho" : "amarelo",
+    nomes: al.slice(0, 3).map(a => NOME_CURTO[a.k] || a.k),
+    extra: Math.max(0, al.length - 3)
+  };
 }
 function consumoDiario7d(s, itemId) {
   const corte = new Date(Date.now() - 7 * 86400000);
@@ -3423,6 +3553,7 @@ const Home = ({
     const ps = s.parametros.filter(p => p.tanqueId === t.id).sort((a, b) => b.ts - a.ts);
     const alertasP = ps[0] ? alertasParametro(s, ps[0]) : [];
     const st = !ps[0] ? null : alertasP.length ? "fora" : "ok";
+    const rt = resumoTanque(s, t.id);
     return /*#__PURE__*/React.createElement("div", {
       key: t.id,
       onClick: () => nav("tanques", {
@@ -3430,7 +3561,7 @@ const Home = ({
       }),
       style: {
         background: C.bg1,
-        border: `1px solid ${st === "fora" ? C.crit + "55" : C.line}`,
+        border: `1px solid ${rt.nivel === "vermelho" ? C.crit + "55" : rt.nivel === "amarelo" ? C.warn + "44" : C.line}`,
         borderRadius: 13,
         padding: 11,
         cursor: "pointer"
@@ -3439,23 +3570,38 @@ const Home = ({
       style: {
         display: "flex",
         justifyContent: "space-between",
-        alignItems: "center"
+        alignItems: "flex-start",
+        gap: 6
       }
     }, /*#__PURE__*/React.createElement("span", {
       style: {
         fontFamily: SERIF,
         fontWeight: 800,
         fontSize: 16,
-        color: C.ink
+        color: C.ink,
+        flexShrink: 0
       }
-    }, t.id), st === null ? /*#__PURE__*/React.createElement("span", {
+    }, t.id), rt.nivel === null ? /*#__PURE__*/React.createElement("span", {
       style: {
         fontSize: 9,
         color: C.muted
       }
-    }, "sem medição") : /*#__PURE__*/React.createElement(Chip, {
-      nivel: st === "fora" ? "crit" : "ok"
-    }, st === "fora" ? "água fora" : "água ok")), lote && k ? /*#__PURE__*/React.createElement("div", {
+    }, "sem medição") : rt.nivel === "verde" ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        fontWeight: 700,
+        color: C.ok,
+        textAlign: "right"
+      }
+    }, "🟢 tudo certo") : /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        fontWeight: 700,
+        color: corNivel(rt.nivel),
+        textAlign: "right",
+        lineHeight: 1.35
+      }
+    }, iconeNivel(rt.nivel), " ", rt.nomes.join(" · "), rt.extra ? ` +${rt.extra}` : "")), lote && k ? /*#__PURE__*/React.createElement("div", {
       style: {
         marginTop: 5,
         fontSize: 11,
@@ -3951,6 +4097,10 @@ const ParamsScreen = ({
   const linhaParam = (k, valor, faixaKey, dec = 1) => {
     const fx = F[faixaKey];
     const st = checaFaixa(fx, valor);
+    /* nível do semáforo e para que lado o valor saiu da faixa — "abaixo"/"acima"
+       diz o que fazer; o antigo "✕ fora" parecia erro do aplicativo. */
+    const nvl = nivelFaixa(faixaKey, fx, valor);
+    const lado = !temNum(valor) || !fx ? null : temNum(fx.min) && valor < fx.min ? "abaixo" : temNum(fx.max) && valor > fx.max ? "acima" : null;
     const vals = hist.slice(0, 10).reverse().map(p => {
       if (faixaKey === "temp") {
         const t = [p.tempSup, p.tempMeio, p.tempFundo].filter(v => v != null);
@@ -3996,11 +4146,16 @@ const ParamsScreen = ({
         fontSize: 16,
         fontWeight: 800,
         fontFamily: SERIF,
-        color: st === "fora" ? C.crit : C.ink
+        color: corNivel(nvl) === C.muted ? C.ink : corNivel(nvl)
       }
-    }, valor != null ? fmtNum(valor, dec) : "—"), st === "fora" && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Chip, {
-      nivel: "crit"
-    }, "fora"))));
+    }, valor != null ? fmtNum(valor, dec) : "—"), lado && /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        fontWeight: 700,
+        color: corNivel(nvl),
+        marginTop: 1
+      }
+    }, lado === "abaixo" ? "↓ abaixo" : "↑ acima")));
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(H2, null, "Parâmetros de água"), /*#__PURE__*/React.createElement(SelTanque, {
     sel: sel,
@@ -4048,7 +4203,87 @@ const ParamsScreen = ({
         padding: "4px 0"
       }
     }, "Gradiente superfície→fundo: ", fmtNum(grad, 1), "°C ", grad > 2 ? "· alto — atenção à estratificação" : "· normal"));
-  })(), linhaParam("amonia", ult.amonia, "amonia"), linhaParam("nitrito", ult.nitrito, "nitrito"), linhaParam("alcalinidade", ult.alcalinidade, "alcalinidade", 0), linhaParam("ph", ult.ph, "ph"), linhaParam("od", ult.od, "od"), linhaParam("salinidade", ult.salinidade, "salinidade"), linhaParam("nitrato", ult.nitrato, "nitrato", 0), linhaParam("dureza", ult.dureza, "dureza", 0), linhaParam("solidos", ult.solidos, "solidos", 0), ult.obs && /*#__PURE__*/React.createElement("div", {
+  })(), (() => {
+    /* ===== Bloco de amônia — dois status, uma caixa =====
+       Em cima a NH₃ (tóxica), em destaque: responde "o peixe corre risco AGORA?".
+       Embaixo a total: responde "o floco está processando o nitrogênio?".
+       Os dois convivem de propósito. No B2 de 08/08 a tóxica estava verde e a total
+       vermelha: peixe seguro, sistema acumulando nitrogênio. Silenciar a de baixo
+       esconderia o problema até o pH subir e virar emergência. */
+    const nh = nh3De(ult);
+    const nvlNh = nh.valor !== null ? nivelFaixa("nh3", F.nh3, nh.valor) : null;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        border: `1px solid ${nvlNh === "vermelho" ? C.crit + "55" : nvlNh === "amarelo" ? C.warn + "44" : C.line}`,
+        borderRadius: 12,
+        padding: "2px 10px 6px",
+        margin: "8px 0"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        fontWeight: 800,
+        color: C.ouroClaro,
+        letterSpacing: .4,
+        padding: "8px 0 2px"
+      }
+    }, "AMÔNIA"), nh.valor !== null ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 10,
+        padding: "6px 0",
+        borderBottom: `1px solid ${C.line}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12.5,
+        color: C.ink,
+        fontWeight: 700
+      }
+    }, "Amônia tóxica (NH₃)"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.muted
+      }
+    }, "calculada pelo pH e temperatura · ideal até ", fmtNum(F.nh3 ? F.nh3.max : 0.02, 2), " mg/L")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right",
+        flexShrink: 0
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: SERIF,
+        fontSize: 19,
+        fontWeight: 800,
+        color: corNivel(nvlNh) === C.muted ? C.ink : corNivel(nvlNh)
+      }
+    }, fmtNum(nh.valor, 3)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 9.5,
+        fontWeight: 700,
+        color: corNivel(nvlNh)
+      }
+    }, iconeNivel(nvlNh), " ", nvlNh === "vermelho" ? "AGIR AGORA" : nvlNh === "amarelo" ? "OBSERVAR" : "tranquilo"))) : nh.falta.length ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11.5,
+        color: C.warn,
+        padding: "6px 0",
+        borderBottom: `1px solid ${C.line}`,
+        lineHeight: 1.45
+      }
+    }, "🟡 Amônia tóxica não calculada — falta ", nh.falta.join(" e "), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.muted
+      }
+    }, "A amônia total foi salva. Complete a medição pra saber quanto dela é tóxica.")) : null, linhaParam("amonia", ult.amonia, "amonia"));
+  })(), linhaParam("nitrito", ult.nitrito, "nitrito"), linhaParam("alcalinidade", ult.alcalinidade, "alcalinidade", 0), linhaParam("ph", ult.ph, "ph"), linhaParam("od", ult.od, "od"), linhaParam("salinidade", ult.salinidade, "salinidade"), linhaParam("nitrato", ult.nitrato, "nitrato", 0), linhaParam("dureza", ult.dureza, "dureza", 0), linhaParam("solidos", ult.solidos, "solidos", 0), ult.obs && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: C.ink2,
@@ -11374,7 +11609,7 @@ const SemAcesso = () => /*#__PURE__*/React.createElement(Card, null, /*#__PURE__
 }, "Os módulos ", /*#__PURE__*/React.createElement("b", null, "Financeiro"), " e ", /*#__PURE__*/React.createElement("b", null, "Planos & Preços"), " são visíveis apenas para o Administrador master e para os Sócios. Se você precisa desse acesso, peça ao administrador da fazenda."));
 
 /* ================= Condições ideais — faixas de referência dos parâmetros ================= */
-const ORDEM_PARAMS = ["temp", "od", "ph", "amonia", "nitrito", "alcalinidade", "salinidade", "nitrato", "dureza", "solidos"];
+const ORDEM_PARAMS = ["temp", "od", "ph", "nh3", "amonia", "nitrito", "alcalinidade", "salinidade", "nitrato", "dureza", "solidos"];
 function textoFaixaIdeal(f) {
   const un = f.unit ? " " + f.unit : "";
   const temMin = f.min !== null && f.min !== undefined;
@@ -11385,7 +11620,7 @@ function textoFaixaIdeal(f) {
   return "—";
 }
 function textoCritico(k, f) {
-  const cr = FAIXAS_CRIT[k] || {};
+  const cr = critDe(k);
   const un = f.unit ? " " + f.unit : "";
   const p = [];
   if (cr.critMin !== null && cr.critMin !== undefined) p.push(`abaixo de ${fmtNum(cr.critMin, cr.critMin % 1 ? 1 : 0)}${un}`);
@@ -11452,14 +11687,14 @@ const CondicoesScreen = () => {
       }
     }, f.label), /*#__PURE__*/React.createElement(KV, {
       linhas: [["🟢 Ideal", textoFaixaIdeal(f), C.ok], ...(crit ? [["🔴 Crítico", crit, C.crit]] : [])]
-    }), (FAIXAS_CRIT[k] || {}).acao ? /*#__PURE__*/React.createElement("div", {
+    }), critDe(k).acao ? /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 11,
         color: C.muted,
         marginTop: 4,
         lineHeight: 1.5
       }
-    }, "No vermelho: ", (FAIXAS_CRIT[k] || {}).acao) : null);
+    }, "No vermelho: ", critDe(k).acao) : null);
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
@@ -11470,15 +11705,25 @@ const CondicoesScreen = () => {
   }, "As faixas de referência são um ponto de partida técnico — confirme com seu engenheiro de pesca. Editar aqui muda os alertas do app na hora."), modal && /*#__PURE__*/React.createElement(FormModal, {
     titulo: "Editar faixas ideais",
     onFechar: () => setModal(false),
-    inicial: Object.fromEntries(Object.entries(F).flatMap(([k, f]) => [[k + "_min", f.min], [k + "_max", f.max]])),
+    inicial: Object.fromEntries(Object.entries(F).flatMap(([k, f]) => [[k + "_min", f.min], [k + "_max", f.max], [k + "_cmin", critDe(k).critMin], [k + "_cmax", critDe(k).critMax]])),
     campos: ORDEM_PARAMS.filter(k => F[k]).flatMap(k => [{
       k: k + "_min",
-      label: `${F[k].label} — mín.`,
+      label: `${F[k].label} — ideal mín.`,
       type: "number",
       unit: F[k].unit
     }, {
       k: k + "_max",
-      label: `${F[k].label} — máx.`,
+      label: `${F[k].label} — ideal máx.`,
+      type: "number",
+      unit: F[k].unit
+    }, {
+      k: k + "_cmin",
+      label: `${F[k].label} — crítico abaixo de`,
+      type: "number",
+      unit: F[k].unit
+    }, {
+      k: k + "_cmax",
+      label: `${F[k].label} — crítico acima de`,
       type: "number",
       unit: F[k].unit
     }]),
@@ -11492,10 +11737,19 @@ const CondicoesScreen = () => {
     }, "Deixe vazio pra não alertar naquele limite (ex.: oxigênio só tem mínimo). Confirme os valores com seu engenheiro."),
     onSalvar: v => {
       up(d => {
+        if (!d.config.faixasCrit) d.config.faixasCrit = {};
         Object.keys(d.config.faixas).forEach(k => {
           if (v[k + "_min"] !== undefined) d.config.faixas[k].min = v[k + "_min"] === "" ? null : num(v[k + "_min"]);
           if (v[k + "_max"] !== undefined) d.config.faixas[k].max = v[k + "_max"] === "" ? null : num(v[k + "_max"]);
+          if (v[k + "_cmin"] !== undefined || v[k + "_cmax"] !== undefined) {
+            d.config.faixasCrit[k] = {
+              ...(d.config.faixasCrit[k] || {}),
+              critMin: v[k + "_cmin"] === "" || v[k + "_cmin"] === undefined ? null : num(v[k + "_cmin"]),
+              critMax: v[k + "_cmax"] === "" || v[k + "_cmax"] === undefined ? null : num(v[k + "_cmax"])
+            };
+          }
         });
+        aplicarCriticasDoConfig(d.config);
         d.config.um = Date.now();
       });
       setModal(false);
@@ -11606,6 +11860,7 @@ function AppCarregado({
   const rodandoRef = useRef(false);
   const pushTimer = useRef(null);
   const aplicar = d => {
+    aplicarCriticasDoConfig(d.config);
     setS(d);
     sRef.current = d;
     persist(d, engineRef.current);
@@ -11711,6 +11966,7 @@ function AppCarregado({
     const d = structuredClone(prev);
     fn(d);
     recalcEstoque(d);
+    aplicarCriticasDoConfig(d.config);
     sRef.current = d;
     persist(d, engineRef.current);
     dirtyRef.current = true;
